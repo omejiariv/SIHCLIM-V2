@@ -895,35 +895,41 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
         if not df_anual_melted.empty:
             df_anual_melted_sorted = df_anual_melted.dropna(subset=[Config.PRECIPITATION_COL])
 
-            fig_racing = px.bar(
-                df_anual_melted_sorted, x=Config.PRECIPITATION_COL, y=Config.STATION_NAME_COL,
-                animation_frame=Config.YEAR_COL, orientation='h',
-                labels={Config.PRECIPITATION_COL: 'Precipitación Anual (mm)',
-                        Config.STATION_NAME_COL: 'Estación'},
-                title=f"Evolución de Precipitación Anual por Estación ({st.session_state.year_range[0]} - {st.session_state.year_range[1]})"
-            )
-
-            fig_racing.update_traces(texttemplate='%{x:.0f}', textposition='outside')
-            
-            # CORRECCIÓN 2: Ajuste del rango del eje X (Asegurar límite superior explícito)
+            # 1. Definir el rango del eje X de forma estática (máximo global + 15%)
             max_val_plot = df_anual_melted[Config.PRECIPITATION_COL].max()
             x_range = [0, max_val_plot * 1.15 if max_val_plot > 0 else 100]
 
+            fig_racing = px.bar(
+                df_anual_melted_sorted, x=Config.PRECIPITATION_COL, y=Config.STATION_NAME_COL,
+                animation_frame=Config.YEAR_COL, orientation='h',
+                # ... (otros argumentos)
+            )
+
+            # Estabilizar el eje horizontal (Precipitación)
             fig_racing.update_layout(
-                xaxis_range=x_range,
+                xaxis_range=x_range, # <--- APLICACIÓN DE LA ESCALA FIJA
                 height=max(600, len(stations_for_analysis) * 35),
                 title_font_size=20, font_size=12,
                 yaxis=dict(categoryorder='total ascending')
             )
-
-            if fig_racing.layout.sliders:
-                fig_racing.layout.sliders[0]['currentvalue']['font']['size'] = 24
-                fig_racing.layout.sliders[0]['currentvalue']['prefix'] = '<b>Año: </b>'
             
-            if fig_racing.layout.updatemenus:
-                fig_racing.layout.updatemenus[0].buttons[0].args[1]['frame']['duration'] = 800
-                fig_racing.layout.updatemenus[0].buttons[0].args[1]['transition']['duration'] = 500
-
+            # 2. Definir el rango de la animación (1970 a 2025)
+            # Aunque no haya datos, forzamos la animación hasta 2025
+            min_year_data = int(df_anual_melted_sorted[Config.YEAR_COL].min())
+            
+            if fig_racing.layout.sliders:
+                fig_racing.layout.sliders[0].active = len(fig_racing.frames) - 1 # Se inicia en el último año de datos
+                fig_racing.layout.sliders[0].steps = [
+                    {
+                        "args": [
+                            [frame.name],
+                            {"frame": {"duration": 800, "redraw": True}, "mode": "immediate"}
+                        ],
+                        "label": frame.name,
+                        "method": "animate"
+                    } for frame in fig_racing.frames
+                ]
+            
             st.plotly_chart(fig_racing, use_container_width=True)
         else:
             st.warning("No hay datos anuales para el gráfico de carrera.")
