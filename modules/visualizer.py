@@ -187,7 +187,7 @@ def get_map_options():
     return {
         "CartoDB Positron (Predeterminado)": {"tiles": "cartodbpositron", "attr": '&copy; <a href="https://carto.com/attributions">CartoDB</a>', "overlay": False},
         "OpenStreetMap": {"tiles": "OpenStreetMap", "attr": '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors', "overlay": False},
-        "Topografía (OpenTopoMap)": {"tiles": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", "attr": 'Map data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, <a href="http://viewfinderpanoramas.org">SRTM</a> | Map style: &copy; <a href="https://opentopomap.org">Open Topo Map</a> (<a href="https://creativecommons.org/licenses/by-sa/3.0/">CC-BY-SA</a>)', "overlay": False},
+        "Topografía (OpenTopoMap)": {"tiles": "https://{s}.tile.opentomap.org/{z}/{x}/{y}.png", "attr": 'Map data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, <a href="http://viewfinderpanoramas.org">SRTM</a> | Map style: &copy; <a href="https://opentopomap.org">Open Topo Map</a> (<a href="https://creativecommons.org/licenses/by-sa/3.0/">CC-BY-SA</a>)', "overlay": False},
         "Relieve (Stamen Terrain)": {"tiles": "Stamen Terrain", "attr": 'Map tiles by <a href="http://stamen.com">Stamen Design</a>, <a href="http://creativecommons.org/licenses/by/3.0">CC BY 3.0</a> &mdash; Map data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors', "overlay": False},
         "Relieve y Océanos (GEBCO)": {"url": "https://www.gebco.net/data_and_products/gebco_web_services/web_map_service/web_map_service.php", "layers": "GEBCO_2021_Surface", "transparent": False, "attr": "GEBCO 2021", "overlay": True},
         "Mapa de Colombia (WMS IDEAM)": {"url": "https://geoservicios.ideam.gov.co/geoserver/ideam/wms", "layers": "ideam:col_admin", "transparent": True, "attr": "IDEAM", "overlay": True},
@@ -769,7 +769,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                 if not station_data_list.empty:
                     station_data = station_data_list.iloc[0]
                     
-                    # CORRECCIÓN 2: Aumento de zoom para centrar en la estación
+                    # Aumento de zoom para centrar en la estación
                     m = create_folium_map(
                         location=[station_data['geometry'].y, station_data['geometry'].x],
                         zoom=10, # Aumentar el zoom para mejor visualización
@@ -895,41 +895,35 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
         if not df_anual_melted.empty:
             df_anual_melted_sorted = df_anual_melted.dropna(subset=[Config.PRECIPITATION_COL])
 
-            # 1. Definir el rango del eje X de forma estática (máximo global + 15%)
-            max_val_plot = df_anual_melted[Config.PRECIPITATION_COL].max()
-            x_range = [0, max_val_plot * 1.15 if max_val_plot > 0 else 100]
-
             fig_racing = px.bar(
                 df_anual_melted_sorted, x=Config.PRECIPITATION_COL, y=Config.STATION_NAME_COL,
                 animation_frame=Config.YEAR_COL, orientation='h',
-                # ... (otros argumentos)
+                labels={Config.PRECIPITATION_COL: 'Precipitación Anual (mm)',
+                        Config.STATION_NAME_COL: 'Estación'},
+                title=f"Evolución de Precipitación Anual por Estación ({st.session_state.year_range[0]} - {st.session_state.year_range[1]})"
             )
 
-            # Estabilizar el eje horizontal (Precipitación)
+            fig_racing.update_traces(texttemplate='%{x:.0f}', textposition='outside')
+            
+            # CORRECCIÓN 2: Ajuste del rango del eje X (Asegurar límite superior explícito)
+            max_val_plot = df_anual_melted[Config.PRECIPITATION_COL].max()
+            x_range = [0, max_val_plot * 1.15 if max_val_plot > 0 else 100]
+
             fig_racing.update_layout(
-                xaxis_range=x_range, # <--- APLICACIÓN DE LA ESCALA FIJA
+                xaxis_range=x_range,
                 height=max(600, len(stations_for_analysis) * 35),
                 title_font_size=20, font_size=12,
                 yaxis=dict(categoryorder='total ascending')
             )
-            
-            # 2. Definir el rango de la animación (1970 a 2025)
-            # Aunque no haya datos, forzamos la animación hasta 2025
-            min_year_data = int(df_anual_melted_sorted[Config.YEAR_COL].min())
-            
+
             if fig_racing.layout.sliders:
-                fig_racing.layout.sliders[0].active = len(fig_racing.frames) - 1 # Se inicia en el último año de datos
-                fig_racing.layout.sliders[0].steps = [
-                    {
-                        "args": [
-                            [frame.name],
-                            {"frame": {"duration": 800, "redraw": True}, "mode": "immediate"}
-                        ],
-                        "label": frame.name,
-                        "method": "animate"
-                    } for frame in fig_racing.frames
-                ]
+                fig_racing.layout.sliders[0]['currentvalue']['font']['size'] = 24
+                fig_racing.layout.sliders[0]['currentvalue']['prefix'] = '<b>Año: </b>'
             
+            if fig_racing.layout.updatemenus:
+                fig_racing.layout.updatemenus[0].buttons[0].args[1]['frame']['duration'] = 800
+                fig_racing.layout.updatemenus[0].buttons[0].args[1]['transition']['duration'] = 500
+
             st.plotly_chart(fig_racing, use_container_width=True)
         else:
             st.warning("No hay datos anuales para el gráfico de carrera.")
@@ -1051,6 +1045,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     data_with_geom = pd.merge(data, gdf_stations_info, on=Config.STATION_NAME_COL)
                     
                     # CORRECCIÓN DE GEOPANDAS: Convertir a GeoDataFrame para usar total_bounds
+                    # Esto resuelve el error 'DataFrame' object has no attribute 'total_bounds'
                     gpd_data = gpd.GeoDataFrame(
                         data_with_geom, geometry='geometry', crs=gdf_stations_info.crs
                     ) 
@@ -1076,7 +1071,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     folium.LayerControl().add_to(m)
 
                 with col:
-                    # CORRECCIÓN 3: Reducción de la altura (ajuste de estilo)
+                    # CORRECCIÓN 3: Ajuste de altura para forzar el renderizado y evitar colapso
                     folium_static(m, height=450, width="100%")
 
             gdf_stations_geometries = gdf_filtered[[Config.STATION_NAME_COL,
@@ -1667,7 +1662,7 @@ def display_correlation_tab(df_monthly_filtered, stations_for_analysis):
                     st.metric("Coeficiente de Correlación (r)", f"{corr:.3f}")
 
                     if p_value < 0.05:
-                        st.success(f"La correlación es estadísticamente significativa (p<{p_value:.4f}).")
+                        st.success("La correlación es estadísticamente significativa, lo que sugiere una relación lineal entre las variables.")
                     else:
                         st.warning("La correlación no es estadísticamente significativa (p>={p_value:.4f}).")
 
