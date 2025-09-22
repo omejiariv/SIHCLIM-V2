@@ -207,7 +207,7 @@ def display_spatial_distribution_tab(gdf_filtered, stations_for_analysis, df_anu
                 st.markdown("---")
                 m1, m2 = st.columns([1, 3])
                 with m1:
-                    # CORRECCIÓN 3: Mostrar logo gota en la columna de métrica
+                    # CORRECCIÓN 3: Mostrar logo gota (usando la ruta del logo principal)
                     if os.path.exists(Config.LOGO_DROP_PATH):
                         st.image(Config.LOGO_DROP_PATH, width=50)
                 with m2:
