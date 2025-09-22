@@ -37,7 +37,7 @@ def display_percentile_analysis_subtab(df_monthly_filtered, station_to_analyze_p
     st.warning(f"La funcionalidad de análisis por percentiles para la estación '{station_to_analyze_perc}' aún no ha sido implementada.")
     pass
 
-# --- FUNCIÓN AUXILIAR PARA POPUP REUTILIZABLE (Problema 2) ---
+# --- FUNCIÓN AUXILIAR PARA POPUP REUTILIZABLE ---
 def generate_station_popup_html(row, df_anual_melted, include_chart=False, df_monthly_filtered=None):
     """Genera el contenido HTML estándar del popup de una estación, opcionalmente incluyendo el mini-gráfico."""
     
@@ -1111,7 +1111,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
             def generate_interpolation_map(year, method, gdf_filtered_map):
                 data_year_with_geom = pd.merge(
                     df_anual_non_na[df_anual_non_na[Config.YEAR_COL] == year],
-                    # Aseguramos la columna de geometría para Folium/Geopandas y las coordenadas numéricas
+                    # Aseguramos la columna de geometría para Folium/GeoPandas y las coordenadas numéricas
                     gdf_filtered_map[[Config.STATION_NAME_COL, 'geometry', Config.LATITUDE_COL, Config.LONGITUDE_COL]].drop_duplicates(),
                     on=Config.STATION_NAME_COL
                 )
@@ -1161,8 +1161,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                                                                                        labelfont=dict(size=10, color='white'))))
                     
                     # CORRECCIÓN: Usamos las columnas numéricas para Plotly Scatter (tooltips)
-                    # El tooltip ya está implícito con hover_data/hover_text si usamos px.scatter_geo, 
-                    # pero aquí lo hacemos manualmente para los puntos.
+                    # Añadimos el texto del popup (tooltip) de forma explícita
                     fig.add_trace(go.Scatter(x=df_plot_scatter[Config.LONGITUDE_COL], 
                                              y=df_plot_scatter[Config.LATITUDE_COL], 
                                              mode='markers', marker=dict(color='red', size=5), name='Estaciones',
