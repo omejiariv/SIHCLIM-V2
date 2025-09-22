@@ -34,7 +34,6 @@ if 'gif_reload_key' not in st.session_state:
 
 #--- Marcador de Posición para Funciones No Definidas
 def display_percentile_analysis_subtab(df_monthly_filtered, station_to_analyze_perc):
-    # Solicitud de desarrollo: Análisis por percentiles
     st.warning(f"La funcionalidad de análisis por percentiles para la estación '{station_to_analyze_perc}' aún no ha sido implementada.")
     pass
 
@@ -62,7 +61,7 @@ def generate_station_popup_html(row, df_anual_melted, include_chart=False, df_mo
         precip_media_anual = 0
 
     html_content = f"""
-    <h4>Estación: {station_name}</h4>
+    <h4>{station_name}</h4>
     <p><b>Municipio:</b> {row.get(Config.MUNICIPALITY_COL, 'N/A')}</p>
     <p><b>Altitud:</b> {row.get(Config.ALTITUDE_COL, 'N/A')} m</p>
     <p><b>Promedio Anual:</b> {precip_media_anual:.0f} mm</p>
@@ -266,7 +265,7 @@ def display_spatial_distribution_tab(gdf_filtered, stations_for_analysis, df_anu
                 st.markdown("---")
                 m1, m2 = st.columns([1, 3])
                 with m1:
-                    # CORRECCIÓN 3: Mostrar logo gota (usando la ruta del logo principal)
+                    # Mostrar logo gota (usando la ruta del logo principal)
                     if os.path.exists(Config.LOGO_DROP_PATH):
                         st.image(Config.LOGO_DROP_PATH, width=50)
                 with m2:
@@ -743,7 +742,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     contents = file.read()
                     data_url = base64.b64encode(contents).decode("utf-8")
                     
-                    # CORRECCIÓN 1: Reducción del tamaño del GIF al 70% (solicitado por el usuario)
+                    # Reducción del tamaño del GIF al 70% (solicitado por el usuario)
                     st.markdown(
                         f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:70%;" key={st.session_state["gif_reload_key"]}>', 
                         unsafe_allow_html=True
@@ -770,7 +769,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                 if not station_data_list.empty:
                     station_data = station_data_list.iloc[0]
                     
-                    # CORRECCIÓN 2: Aumento de zoom para centrar en la estación
+                    # Aumento de zoom para centrar en la estación
                     m = create_folium_map(
                         location=[station_data['geometry'].y, station_data['geometry'].x],
                         zoom=10, # Aumentar el zoom para mejor visualización
@@ -1189,6 +1188,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
 
 def display_drought_analysis_tab(df_monthly_filtered, stations_for_analysis):
     st.header("Análisis de Extremos Hidrológicos")
+    st.markdown("Esta sección ofrece dos metodologías para identificar eventos extremos: el **análisis de percentiles** para extremos puntuales y el **Índice Estandarizado de Precipitación (SPI)** para evaluar la intensidad de la sequía o humedad.")
 
     if not stations_for_analysis:
         st.warning("Por favor, seleccione al menos una estación para ver esta sección.")
@@ -1201,9 +1201,8 @@ def display_drought_analysis_tab(df_monthly_filtered, stations_for_analysis):
                                                options=sorted(stations_for_analysis),
                                                key="percentile_station_select")
         
-        # Solicitud de desarrollo: Análisis por percentiles
         if station_to_analyze_perc:
-            st.warning(f"La funcionalidad de análisis por percentiles para la estación '{station_to_analyze_perc}' aún no ha sido implementada.")
+            display_percentile_analysis_subtab(df_monthly_filtered, station_to_analyze_perc)
 
     with spi_sub_tab:
         st.subheader("Análisis con el índice Estandarizado de Precipitación (SPI)")
