@@ -709,7 +709,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     
                     # CORRECCIÓN 1: Reducción del tamaño del GIF a 50% y uso de la clave de reinicio
                     st.markdown(
-                        f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:50%;" key={st.session_state["gif_reload_key"]}>', 
+                        f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:60%;" key={st.session_state["gif_reload_key"]}>', 
                         unsafe_allow_html=True
                     )
         else:
