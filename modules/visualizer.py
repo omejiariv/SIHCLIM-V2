@@ -780,23 +780,10 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     df_station_monthly_avg = \
                         df_monthly_filtered[df_monthly_filtered[Config.STATION_NAME_COL] == station_to_show]
 
-                    # Generar el mini-gráfico para el popup
+                    # Generar el mini-gráfico y popup
                     if not df_station_monthly_avg.empty:
-                        df_monthly_avg = \
-                            df_station_monthly_avg.groupby(Config.MONTH_COL)[Config.PRECIPITATION_COL].mean().reset_index()
-
-                        fig = go.Figure(data=[go.Bar(x=df_monthly_avg[Config.MONTH_COL],
-                                                     y=df_monthly_avg[Config.PRECIPITATION_COL])])
-                        
-                        fig.update_layout(title=f"Ppt. Mensual Media",
-                                          xaxis_title="Mes", yaxis_title="Ppt. (mm)", height=250, width=350,
-                                          margin=dict(t=50, b=20, l=20, r=20))
-                        
-                        popup_html_chart = fig.to_html(full_html=False, include_plotlyjs='cdn')
-                        
-                        # Reutilizar la lógica del popup
-                        popup_html = generate_station_popup_html(station_data, df_anual_melted)
-                        popup_html += f"<hr>{popup_html_chart}"
+                        # Reutilizar la lógica del popup, indicando que incluya el gráfico
+                        popup_html = generate_station_popup_html(station_data, df_anual_melted, include_chart=True, df_monthly_filtered=df_monthly_filtered)
                         
                         folium.Marker(location=[station_data['geometry'].y, station_data['geometry'].x],
                                       popup=folium.Popup(popup_html, max_width=400)).add_to(m)
@@ -953,6 +940,10 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                 all_selected_stations_info = \
                     gdf_filtered.drop_duplicates(subset=[Config.STATION_NAME_COL])
                 
+                full_grid = pd.MultiIndex.from_product([all_selected_stations_info[Config.STATION_NAME_COL], all_years],
+                                               names=[Config.STATION_NAME_COL, Config.YEAR_COL]).to_frame(index=False)
+                
+                # CORRECCIÓN DE GEOMETRÍA: Aseguramos LAT/LON numéricas y el objeto GeoSeries
                 full_grid = pd.merge(full_grid, all_selected_stations_info[['geometry', Config.LATITUDE_COL, Config.LONGITUDE_COL,
                                         Config.STATION_NAME_COL]].drop_duplicates(), on=Config.STATION_NAME_COL)
                 
@@ -1079,7 +1070,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     folium.LayerControl().add_to(m)
 
                 with col:
-                    # CORRECCIÓN 3: Reducción de la altura (ajuste de estilo)
+                    # CORRECCIÓN 3: Ajuste de altura para forzar el renderizado y evitar colapso
                     folium_static(m, height=450, width="100%")
 
             gdf_stations_geometries = gdf_filtered[[Config.STATION_NAME_COL,
@@ -1169,10 +1160,14 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                                                     contours=dict(showlabels=True,
                                                                                        labelfont=dict(size=10, color='white'))))
                     
-                    # CORRECCIÓN: Usamos las columnas numéricas para Plotly Scatter.
+                    # CORRECCIÓN: Usamos las columnas numéricas para Plotly Scatter (tooltips)
+                    # El tooltip ya está implícito con hover_data/hover_text si usamos px.scatter_geo, 
+                    # pero aquí lo hacemos manualmente para los puntos.
                     fig.add_trace(go.Scatter(x=df_plot_scatter[Config.LONGITUDE_COL], 
                                              y=df_plot_scatter[Config.LATITUDE_COL], 
-                                             mode='markers', marker=dict(color='red', size=5), name='Estaciones'))
+                                             mode='markers', marker=dict(color='red', size=5), name='Estaciones',
+                                             text=df_plot_scatter.apply(lambda row: f"{row[Config.STATION_NAME_COL]}: {row[Config.PRECIPITATION_COL]:.0f} mm", axis=1),
+                                             hoverinfo='text'))
                     
                     fig.update_layout(title=f"Precipitación en {year} ({method})", height=600)
                     return fig
@@ -1667,7 +1662,7 @@ def display_correlation_tab(df_monthly_filtered, stations_for_analysis):
                     if p_value < 0.05:
                         st.success(f"La correlación es estadísticamente significativa (p<{p_value:.4f}).")
                     else:
-                        st.warning(f"La correlación no es estadísticamente significativa (p>={p_value:.4f}).")
+                        st.warning("La correlación no es estadísticamente significativa (p>={p_value:.4f}).")
 
                     fig_scatter_indices = px.scatter(
                         df_merged_indices, x=index_col_name, y=Config.PRECIPITATION_COL,
