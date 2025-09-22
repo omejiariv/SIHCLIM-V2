@@ -798,7 +798,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
 
                     folium.LayerControl().add_to(m)
                     # CORRECCIÓN 2: Aumento de la altura de Folium a 600px para garantizar renderizado
-                    folium_static(m, height=600, width="100%") 
+                    folium_static(m, height=100, width="100%") 
                 else:
                     st.warning(f"No se encontró información geográfica para la estación {station_to_show}.")
 
