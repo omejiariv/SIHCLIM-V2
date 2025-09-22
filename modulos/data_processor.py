@@ -247,10 +247,10 @@ def calculate_spi(series, window):
     spi = norm.ppf(cdf)
     
     # CORRECCIÓN: Usar np.where y np.isinf para reemplazar infinities con NaN en el array.
-    # Soluciona el AttributeError: 'numpy.ndarray' object has no attribute 'replace'
     spi = np.where(np.isinf(spi), np.nan, spi)
     
     # Reconvertir a Series usando el índice de rolling_sum, que es la Series original.
+    # Esto soluciona el AttributeError: 'numpy.ndarray' object has no attribute 'index'
     spi = pd.Series(spi, index=rolling_sum.index)
 
     return spi
@@ -287,4 +287,4 @@ def interpolate_rbf_spline(lons, lats, vals, grid_lon, grid_lat, function='thin_
     # FIX: La función 'thin_plate' es aceptada por la librería. Aseguramos su nombre.
     rbf = Rbf(lons, lats, vals, function=function) 
     z = rbf(grid_x, grid_y)
-    return z.T # Transponer para que coincida con la orientac
+    return z.T # Transponer para que coincida con la orientación de plotly
