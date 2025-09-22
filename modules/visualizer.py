@@ -16,6 +16,7 @@ import matplotlib.cm as mpl_cm # Importado para usar paletas estables
 from pykrige.ok import OrdinaryKriging
 from scipy import stats
 from scipy.stats import gamma
+from scipy.interpolate import Rbf # FIX: Aseguramos la importación de Rbf
 import statsmodels.api as sm
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import pacf
@@ -26,6 +27,10 @@ import pymannkendall as mk
 from modules.config import Config
 from modules.utils import add_folium_download_button
 from modules.data_processor import calculate_spi, interpolate_idw, interpolate_rbf_spline
+
+# Inicializamos una variable de estado para controlar el reinicio del GIF
+if 'gif_reload_key' not in st.session_state:
+    st.session_state['gif_reload_key'] = 0
 
 #--- Marcador de Posición para Funciones No Definidas
 def display_percentile_analysis_subtab(df_monthly_filtered, station_to_analyze_perc):
@@ -672,24 +677,6 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
     
     gif_tab, mapa_interactivo_tab, temporal_tab, race_tab, anim_tab, compare_tab, kriging_tab = st.tabs(tab_names)
 
-# Inicializamos una variable de estado para controlar el reinicio del GIF
-if 'gif_reload_key' not in st.session_state:
-    st.session_state['gif_reload_key'] = 0
-
-def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analysis, df_monthly_filtered):
-    st.header("Mapas Avanzados")
-
-    if not stations_for_analysis:
-        st.warning("Por favor, seleccione al menos una estación para ver esta sección.")
-        return
-
-    st.info(f"Mostrando análisis para {len(stations_for_analysis)} estaciones en el período {st.session_state.year_range[0]} - {st.session_state.year_range[1]}.")
-
-    tab_names = ["Animación GIF (Antioquia)", "Mapa Interactivo de Estaciones", "Visualización Temporal",
-                 "Gráfico de Carrera", "Mapa Animado", "Comparación de Mapas", "Interpolación Comparativa"]
-    
-    gif_tab, mapa_interactivo_tab, temporal_tab, race_tab, anim_tab, compare_tab, kriging_tab = st.tabs(tab_names)
-
     with gif_tab:
         st.subheader("Distribución Espacio-Temporal de la Lluvia en Antioquia")
         
@@ -709,7 +696,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     
                     # CORRECCIÓN 1: Reducción del tamaño del GIF a 50% y uso de la clave de reinicio
                     st.markdown(
-                        f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:60%;" key={st.session_state["gif_reload_key"]}>', 
+                        f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:50%;" key={st.session_state["gif_reload_key"]}>', 
                         unsafe_allow_html=True
                     )
         else:
@@ -1388,7 +1375,9 @@ def display_stats_tab(df_long, df_anual_melted, df_monthly_filtered, stations_fo
             logo_col, metric_col = st.columns([1, 5])
 
             with logo_col:
-                if os.path.exists(Config.LOGO_DROP_PATH): st.image(Config.LOGO_DROP_PATH, width=50)
+                # CORRECCIÓN 3: Mostrar logo gota (usando la ruta del logo principal)
+                if os.path.exists(Config.LOGO_DROP_PATH):
+                    st.image(Config.LOGO_DROP_PATH, width=50)
 
             with metric_col: st.metric(label=f"Disponibilidad Promedio Anual ({title_text})",
                                      value=f"{avg_availability:.1f}%")
@@ -2111,7 +2100,6 @@ def display_trends_and_forecast_tab(df_anual_melted, df_monthly_to_process, stat
             fig_mk.add_trace(go.Scatter(x=x_vals, y=y_vals, mode='lines', name="Pendiente de Sen",
                                          line=dict(color='orange')))
             
-            fig_mk.update_layout(xaxis_title="Año", yaxis_title="Precipitación Anual (mm)")
             st.plotly_chart(fig_mk, use_container_width=True)
             
         else:
