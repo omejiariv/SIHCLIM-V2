@@ -235,10 +235,11 @@ def calculate_spi(series, window):
     """Calcula el Índice Estandarizado de Precipitación (SPI) para una serie de tiempo."""
     # 1. Calcula la suma móvil de la precipitación
     rolling_sum = series.rolling(window, min_periods=window).sum()
+    
     # 2. Ajusta una distribución Gamma a los datos de la suma móvil
-    # Se eliminan los ceros y NaNs para un ajuste adecuado
     params = gamma.fit(rolling_sum.dropna(), floc=0)
     shape, loc, scale = params
+    
     # 3. Calcula la probabilidad acumulada (CDF) con la distribución Gamma
     cdf = gamma.cdf(rolling_sum, shape, loc=loc, scale=scale)
     
@@ -246,11 +247,11 @@ def calculate_spi(series, window):
     spi = norm.ppf(cdf)
     
     # CORRECCIÓN: Usar np.where y np.isinf para reemplazar infinities con NaN en el array.
-    # Esto soluciona el AttributeError: 'numpy.ndarray' object has no attribute 'replace'
     spi = np.where(np.isinf(spi), np.nan, spi)
     
-    # Reconvertir a Series para mantener el índice temporal, necesario para la app.
-    spi = pd.Series(spi, index=cdf.index)
+    # Reconvertir a Series usando el índice de rolling_sum, que es la Series original.
+    # Esto soluciona el AttributeError: 'numpy.ndarray' object has no attribute 'index'
+    spi = pd.Series(spi, index=rolling_sum.index)
 
     return spi
 
@@ -283,6 +284,7 @@ def interpolate_idw(lons, lats, vals, grid_lon, grid_lat, power=2):
 def interpolate_rbf_spline(lons, lats, vals, grid_lon, grid_lat, function='thin_plate'):
     """Realiza una interpolación usando Radial Basis Function (Spline)."""
     grid_x, grid_y = np.meshgrid(grid_lon, grid_lat)
-    rbf = Rbf(lons, lats, vals, function=function)
+    # FIX: La función 'thin_plate' es aceptada por la librería. Aseguramos su nombre.
+    rbf = Rbf(lons, lats, vals, function=function) 
     z = rbf(grid_x, grid_y)
     return z.T # Transponer para que coincida con la orientación de plotly
