@@ -74,7 +74,7 @@ class Config:
             'regions_multiselect': [],
             'municipios_multiselect': [],
             'celdas_multiselect': [],
-            'station_multiselect': [], # <--- LÍNEA CORREGIDA/AÑADIDA
+            'station_multiselect': [], # Asegura la inicialización
             'exclude_na': False,
             'exclude_zeros': False,
             'uploaded_forecast': None,
