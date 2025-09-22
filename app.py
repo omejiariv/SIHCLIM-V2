@@ -45,7 +45,7 @@ def main():
     title_col1, title_col2 = st.columns([0.07, 0.93])
     
     with title_col1:
-        # FIX: Mostrar logo principal en el encabezado
+        # Mostrar logo principal en el encabezado
         if os.path.exists(Config.LOGO_PATH):
             st.image(Config.LOGO_PATH, width=50)
     
@@ -192,7 +192,6 @@ def main():
             )
             
             # CORRECCIÓN DE LÓGICA CLAVE: Sincronización inmediata de estaciones después de aplicar filtros
-            # NOTA: st.session_state.station_multiselect está inicializado en config.py
             if st.session_state.get('select_all_checkbox', True) and \
                st.session_state.station_multiselect != stations_options:
                 st.session_state.station_multiselect = stations_options
