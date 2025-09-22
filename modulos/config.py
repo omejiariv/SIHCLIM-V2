@@ -27,9 +27,8 @@ class Config:
     IOD_COL = 'iod'
 
     # Rutas de Archivos (usando la ruta absoluta)
-    # Rutas ajustadas para coincidir con los nombres de archivo sin espacios (CuencaVerde Logo.jpg)
-    LOGO_PATH = os.path.join(BASE_DIR, "data", "Cuenca Verde Logo.jpg")
-    LOGO_DROP_PATH = os.path.join(BASE_DIR, "data", "Cuenca Verde Gotica Logo.jpg")
+    LOGO_PATH = os.path.join(BASE_DIR, "data", "Cuenca Verde Logo_V1.JPG")
+    LOGO_DROP_PATH = os.path.join(BASE_DIR, "data", "Cuenca Verde Gotica Logo.JPG")
     GIF_PATH = os.path.join(BASE_DIR, "data", "PPAM.gif")
     
     # Mensajes de la UI
