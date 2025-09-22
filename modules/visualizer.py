@@ -37,7 +37,7 @@ def display_percentile_analysis_subtab(df_monthly_filtered, station_to_analyze_p
     st.warning(f"La funcionalidad de análisis por percentiles para la estación '{station_to_analyze_perc}' aún no ha sido implementada.")
     pass
 
-# --- FUNCIÓN AUXILIAR PARA POPUP REUTILIZABLE (Problema 2) ---
+# --- FUNCIÓN AUXILIAR PARA POPUP REUTILIZABLE ---
 def generate_station_popup_html(row, df_anual_melted, include_chart=False, df_monthly_filtered=None):
     """Genera el contenido HTML estándar del popup de una estación, opcionalmente incluyendo el mini-gráfico."""
     
@@ -265,7 +265,7 @@ def display_spatial_distribution_tab(gdf_filtered, stations_for_analysis, df_anu
                 st.markdown("---")
                 m1, m2 = st.columns([1, 3])
                 with m1:
-                    # CORRECCIÓN 3: Mostrar logo gota (usando la ruta del logo principal)
+                    # Mostrar logo gota (usando la ruta del logo principal)
                     if os.path.exists(Config.LOGO_DROP_PATH):
                         st.image(Config.LOGO_DROP_PATH, width=50)
                 with m2:
@@ -742,7 +742,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     contents = file.read()
                     data_url = base64.b64encode(contents).decode("utf-8")
                     
-                    # CORRECCIÓN 1: Reducción del tamaño del GIF al 70% (solicitado por el usuario)
+                    # Reducción del tamaño del GIF al 70% (solicitado por el usuario)
                     st.markdown(
                         f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:70%;" key={st.session_state["gif_reload_key"]}>', 
                         unsafe_allow_html=True
@@ -1070,7 +1070,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     folium.LayerControl().add_to(m)
 
                 with col:
-                    # CORRECCIÓN 3: Ajuste de altura para forzar el renderizado y evitar colapso
+                    # CORRECCIÓN 3: Reducción de la altura (ajuste de estilo)
                     folium_static(m, height=450, width="100%")
 
             gdf_stations_geometries = gdf_filtered[[Config.STATION_NAME_COL,
@@ -1087,7 +1087,9 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
         
         df_anual_non_na = df_anual_melted.dropna(subset=[Config.PRECIPITATION_COL])
 
-        if df_anual_non_na.empty or len(df_anual_non_na[Config.YEAR_COL].unique()) == 0:
+        if not stations_for_analysis:
+            st.warning("Por favor, seleccione al menos una estación para ver esta sección.")
+        elif df_anual_non_na.empty or len(df_anual_non_na[Config.YEAR_COL].unique()) == 0:
             st.warning("No hay suficientes datos anuales para realizar la interpolación.")
         else:
             min_year, max_year = int(df_anual_non_na[Config.YEAR_COL].min()), \
@@ -1111,7 +1113,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
             def generate_interpolation_map(year, method, gdf_filtered_map):
                 data_year_with_geom = pd.merge(
                     df_anual_non_na[df_anual_non_na[Config.YEAR_COL] == year],
-                    # Aseguramos la columna de geometría para Folium/Geopandas y las coordenadas numéricas
+                    # Aseguramos la columna de geometría para Folium/GeoPandas y las coordenadas numéricas
                     gdf_filtered_map[[Config.STATION_NAME_COL, 'geometry', Config.LATITUDE_COL, Config.LONGITUDE_COL]].drop_duplicates(),
                     on=Config.STATION_NAME_COL
                 )
@@ -1161,8 +1163,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                                                                                        labelfont=dict(size=10, color='white'))))
                     
                     # CORRECCIÓN: Usamos las columnas numéricas para Plotly Scatter (tooltips)
-                    # El tooltip ya está implícito con hover_data/hover_text si usamos px.scatter_geo, 
-                    # pero aquí lo hacemos manualmente para los puntos.
+                    # Añadimos el texto del popup (tooltip) de forma explícita
                     fig.add_trace(go.Scatter(x=df_plot_scatter[Config.LONGITUDE_COL], 
                                              y=df_plot_scatter[Config.LATITUDE_COL], 
                                              mode='markers', marker=dict(color='red', size=5), name='Estaciones',
