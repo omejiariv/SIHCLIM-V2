@@ -16,7 +16,7 @@ import matplotlib.cm as mpl_cm # Importado para usar paletas estables
 from pykrige.ok import OrdinaryKriging
 from scipy import stats
 from scipy.stats import gamma
-from scipy.interpolate import Rbf # FIX: Aseguramos la importación de Rbf
+from scipy.interpolate import Rbf 
 import statsmodels.api as sm
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import pacf
@@ -1022,7 +1022,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     folium.LayerControl().add_to(m)
 
                 with col:
-                    # CORRECCIÓN 3: Reducción de la altura (ajuste de estilo)
+                    # CORRECCIÓN 3: Ajuste de altura para forzar el renderizado y evitar colapso
                     folium_static(m, height=450, width="100%")
 
             gdf_stations_geometries = gdf_filtered[[Config.STATION_NAME_COL,
@@ -1375,9 +1375,7 @@ def display_stats_tab(df_long, df_anual_melted, df_monthly_filtered, stations_fo
             logo_col, metric_col = st.columns([1, 5])
 
             with logo_col:
-                # CORRECCIÓN 3: Mostrar logo gota (usando la ruta del logo principal)
-                if os.path.exists(Config.LOGO_DROP_PATH):
-                    st.image(Config.LOGO_DROP_PATH, width=50)
+                if os.path.exists(Config.LOGO_DROP_PATH): st.image(Config.LOGO_DROP_PATH, width=50)
 
             with metric_col: st.metric(label=f"Disponibilidad Promedio Anual ({title_text})",
                                      value=f"{avg_availability:.1f}%")
@@ -1865,7 +1863,7 @@ def display_trends_and_forecast_tab(df_anual_melted, df_monthly_to_process, stat
                     )
 
                 except Exception as e:
-                    st.error(f"No se pudo generar el pronóstico SARIMA. El modelo no pudo converger. Error: {e}")
+                    st.error(f"No se pudo generar el pronóstico SARIMA. El modelo no pudo convergir. Error: {e}")
 
     with pronostico_prophet_tab:
         st.subheader("Pronóstico de Precipitación Mensual (Modelo Prophet)")
@@ -2100,6 +2098,7 @@ def display_trends_and_forecast_tab(df_anual_melted, df_monthly_to_process, stat
             fig_mk.add_trace(go.Scatter(x=x_vals, y=y_vals, mode='lines', name="Pendiente de Sen",
                                          line=dict(color='orange')))
             
+            fig_mk.update_layout(xaxis_title="Año", yaxis_title="Precipitación Anual (mm)")
             st.plotly_chart(fig_mk, use_container_width=True)
             
         else:
