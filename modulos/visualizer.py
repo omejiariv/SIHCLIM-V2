@@ -152,7 +152,6 @@ def create_folium_map(location, zoom, base_map_config, overlays_config, fit_boun
     m = folium.Map(location=location, zoom_start=zoom, tiles=base_map_config.get("tiles", "OpenStreetMap"), attr=base_map_config.get("attr", None))
 
     if fit_bounds_data is not None and not fit_bounds_data.empty:
-        # Aquí fit_bounds_data es un GeoDataFrame, por lo que total_bounds funciona
         bounds = fit_bounds_data.total_bounds
         if np.all(np.isfinite(bounds)):
             m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
@@ -207,7 +206,6 @@ def display_spatial_distribution_tab(gdf_filtered, stations_for_analysis, df_anu
                 st.markdown("---")
                 m1, m2 = st.columns([1, 3])
                 with m1:
-                    # CORRECCIÓN 3: Mostrar logo gota
                     if os.path.exists(Config.LOGO_DROP_PATH):
                         st.image(Config.LOGO_DROP_PATH, width=50)
                 with m2:
@@ -283,8 +281,7 @@ def display_spatial_distribution_tab(gdf_filtered, stations_for_analysis, df_anu
                 
                 folium.LayerControl().add_to(m)
                 m.add_child(MiniMap(toggle_display=True))
-                # CORRECCIÓN 1: Reducción de la altura (ajuste de estilo)
-                folium_static(m, height=450, width="100%") 
+                folium_static(m, height=700, width="100%")
                 add_folium_download_button(m, "mapa_distribucion.html")
             else:
                 st.warning("No hay estaciones seleccionadas para mostrar en el mapa.")
@@ -679,8 +676,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
             with open(Config.GIF_PATH, "rb") as file:
                 contents = file.read()
                 data_url = base64.b64encode(contents).decode("utf-8")
-                # CORRECCIÓN 1: Reducción del tamaño del GIF
-                st.markdown(f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:50%;">', unsafe_allow_html=True)
+                st.markdown(f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:100%;">', unsafe_allow_html=True)
         else:
             st.warning(f"No se encontró el archivo GIF en la ruta especificada: {Config.GIF_PATH}")
 
@@ -737,8 +733,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                                       popup=folium.Popup(html_popup, max_width=400)).add_to(m)
 
                     folium.LayerControl().add_to(m)
-                    # CORRECCIÓN 3: Reducción de la altura (ajuste de estilo)
-                    folium_static(m, height=450, width="100%") 
+                    folium_static(m, height=700, width="100%")
                 else:
                     st.warning(f"No se encontró información geográfica para la estación {station_to_show}.")
 
@@ -841,12 +836,8 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
 
             fig_racing.update_traces(texttemplate='%{x:.0f}', textposition='outside')
             
-            # CORRECCIÓN 2: Ajuste del rango del eje X (Asegurar límite superior explícito)
-            max_val_plot = df_anual_melted[Config.PRECIPITATION_COL].max()
-            x_range = [0, max_val_plot * 1.15 if max_val_plot > 0 else 100]
-
             fig_racing.update_layout(
-                xaxis_range=x_range,
+                xaxis_range=[0, df_anual_melted[Config.PRECIPITATION_COL].max() * 1.15],
                 height=max(600, len(stations_for_analysis) * 35),
                 title_font_size=20, font_size=12,
                 yaxis=dict(categoryorder='total ascending')
@@ -982,7 +973,6 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     data_with_geom = pd.merge(data, gdf_stations_info, on=Config.STATION_NAME_COL)
                     
                     # CORRECCIÓN DE GEOPANDAS: Convertir a GeoDataFrame para usar total_bounds
-                    # Esto resuelve el error 'DataFrame' object has no attribute 'total_bounds'
                     gpd_data = gpd.GeoDataFrame(
                         data_with_geom, geometry='geometry', crs=gdf_stations_info.crs
                     ) 
@@ -1004,8 +994,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     folium.LayerControl().add_to(m)
 
                 with col:
-                    # CORRECCIÓN 3: Reducción de la altura (ajuste de estilo)
-                    folium_static(m, height=450, width="100%")
+                    folium_static(m, height=600, width="100%")
 
             gdf_stations_geometries = gdf_filtered[[Config.STATION_NAME_COL,
                                                     'geometry']].drop_duplicates()
@@ -1076,13 +1065,9 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     elif method == "IDW":
                         z_grid = interpolate_idw(lons, lats, vals.values, grid_lon, grid_lat)
                     elif method == "Spline (Thin Plate)":
-                        # CORRECCIÓN DE INTERPOLACIÓN: Aseguramos el nombre de la función 'thin_plate'
-                        # El error de SciPy se debe a que 'thin_plate' debe ser una string en minúsculas.
-                        rbf = Rbf(lons, lats, vals.values, function='thin_plate')
-                        z_grid = rbf(grid_lon, grid_lat)
-                        z_grid = z_grid.T # Transponer para Plotly
+                        z_grid = interpolate_rbf_spline(lons, lats, vals.values, grid_lon, grid_lat,
+                                                        function='thin_plate_spline')
                 except Exception as e:
-                    # Este log de error será crucial si la falla de Spline persiste.
                     st.error(f"Error al calcular {method} para el año {year}: {e}")
                     return go.Figure().update_layout(title=f"Error en {method} para {year}")
 
@@ -1090,7 +1075,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     # Creamos una copia del DataFrame *sin* la columna geometry antes de Plotly
                     df_plot_scatter = data_year_with_geom.drop(columns=['geometry']).copy()
                     
-                    # FIX: Corregimos la paleta de colores a un estándar de Plotly.
+                    # FIX: Corregimos la paleta de colores a un estándar de Plotly, ya que YIGnBu falla.
                     fig = go.Figure(data=go.Contour(z=z_grid.T, x=grid_lon, y=grid_lat,
                                                     colorscale=px.colors.sequential.YlGnBu,
                                                     contours=dict(showlabels=True,
@@ -2335,4 +2320,4 @@ def display_station_table_tab(gdf_filtered, df_anual_melted, stations_for_analys
         #Si no hay datos anuales, añade la columna con un valor indicativo
         df_info_table['Precipitación media anual (mm)'] = 'N/A'
     
-    st.dataframe(df_info_table.drop(columns=[Config.PERCENTAGE_COL]).se
+    st.dataframe(df_info_table.drop(columns=[Config.PERCENTAGE_COL]).set_index(Config.STATION_NAME_COL), use_container_width=True)
