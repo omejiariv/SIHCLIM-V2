@@ -265,7 +265,7 @@ def display_spatial_distribution_tab(gdf_filtered, stations_for_analysis, df_anu
                 st.markdown("---")
                 m1, m2 = st.columns([1, 3])
                 with m1:
-                    # CORRECCIÓN 3: Mostrar logo gota (usando la ruta del logo principal)
+                    # Mostrar logo gota (usando la ruta del logo principal)
                     if os.path.exists(Config.LOGO_DROP_PATH):
                         st.image(Config.LOGO_DROP_PATH, width=50)
                 with m2:
@@ -742,7 +742,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     contents = file.read()
                     data_url = base64.b64encode(contents).decode("utf-8")
                     
-                    # CORRECCIÓN 1: Reducción del tamaño del GIF al 70% (solicitado por el usuario)
+                    # Reducción del tamaño del GIF al 70% (solicitado por el usuario)
                     st.markdown(
                         f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:70%;" key={st.session_state["gif_reload_key"]}>', 
                         unsafe_allow_html=True
@@ -1070,7 +1070,7 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     folium.LayerControl().add_to(m)
 
                 with col:
-                    # CORRECCIÓN 3: Ajuste de altura para forzar el renderizado y evitar colapso
+                    # CORRECCIÓN 3: Reducción de la altura (ajuste de estilo)
                     folium_static(m, height=450, width="100%")
 
             gdf_stations_geometries = gdf_filtered[[Config.STATION_NAME_COL,
@@ -1087,7 +1087,9 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
         
         df_anual_non_na = df_anual_melted.dropna(subset=[Config.PRECIPITATION_COL])
 
-        if df_anual_non_na.empty or len(df_anual_non_na[Config.YEAR_COL].unique()) == 0:
+        if not stations_for_analysis:
+            st.warning("Por favor, seleccione al menos una estación para ver esta sección.")
+        elif df_anual_non_na.empty or len(df_anual_non_na[Config.YEAR_COL].unique()) == 0:
             st.warning("No hay suficientes datos anuales para realizar la interpolación.")
         else:
             min_year, max_year = int(df_anual_non_na[Config.YEAR_COL].min()), \
