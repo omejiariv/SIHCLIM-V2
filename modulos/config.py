@@ -7,7 +7,6 @@ import os
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class Config:
-    # Nombres de Columnas de Datos
     STATION_NAME_COL = 'nom_est'
     PRECIPITATION_COL = 'precipitation'
     LATITUDE_COL = 'latitud_geo'
