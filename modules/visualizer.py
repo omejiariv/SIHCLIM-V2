@@ -672,15 +672,46 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
     
     gif_tab, mapa_interactivo_tab, temporal_tab, race_tab, anim_tab, compare_tab, kriging_tab = st.tabs(tab_names)
 
+# Inicializamos una variable de estado para controlar el reinicio del GIF
+if 'gif_reload_key' not in st.session_state:
+    st.session_state['gif_reload_key'] = 0
+
+def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analysis, df_monthly_filtered):
+    st.header("Mapas Avanzados")
+
+    if not stations_for_analysis:
+        st.warning("Por favor, seleccione al menos una estación para ver esta sección.")
+        return
+
+    st.info(f"Mostrando análisis para {len(stations_for_analysis)} estaciones en el período {st.session_state.year_range[0]} - {st.session_state.year_range[1]}.")
+
+    tab_names = ["Animación GIF (Antioquia)", "Mapa Interactivo de Estaciones", "Visualización Temporal",
+                 "Gráfico de Carrera", "Mapa Animado", "Comparación de Mapas", "Interpolación Comparativa"]
+    
+    gif_tab, mapa_interactivo_tab, temporal_tab, race_tab, anim_tab, compare_tab, kriging_tab = st.tabs(tab_names)
+
     with gif_tab:
         st.subheader("Distribución Espacio-Temporal de la Lluvia en Antioquia")
         
         if os.path.exists(Config.GIF_PATH):
-            with open(Config.GIF_PATH, "rb") as file:
-                contents = file.read()
-                data_url = base64.b64encode(contents).decode("utf-8")
-                # CORRECCIÓN 1: Reducción del tamaño del GIF a 50%
-                st.markdown(f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:50%;">', unsafe_allow_html=True)
+            col_controls, col_gif = st.columns([1, 3])
+            
+            with col_controls:
+                # Botón de reinicio que incrementa la clave para forzar la recarga
+                if st.button("🔄 Reiniciar Animación"):
+                    st.session_state['gif_reload_key'] += 1
+                    st.rerun()
+
+            with col_gif:
+                with open(Config.GIF_PATH, "rb") as file:
+                    contents = file.read()
+                    data_url = base64.b64encode(contents).decode("utf-8")
+                    
+                    # CORRECCIÓN 1: Reducción del tamaño del GIF a 50% y uso de la clave de reinicio
+                    st.markdown(
+                        f'<img src="data:image/gif;base64,{data_url}" alt="Animación PPAM" style="width:50%;" key={st.session_state["gif_reload_key"]}>', 
+                        unsafe_allow_html=True
+                    )
         else:
             st.warning(f"No se encontró el archivo GIF en la ruta especificada: {Config.GIF_PATH}")
 
