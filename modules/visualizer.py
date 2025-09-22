@@ -888,7 +888,6 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
         else:
             st.warning("No hay datos anuales para la visualización temporal.")
 
-
     with race_tab:
         st.subheader("Ranking Anual de Precipitación por Estación")
         
@@ -933,7 +932,6 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
             st.plotly_chart(fig_racing, use_container_width=True)
         else:
             st.warning("No hay datos anuales para el gráfico de carrera.")
-
 
     with anim_tab:
         st.subheader("Mapa Animado de Precipitación Anual")
