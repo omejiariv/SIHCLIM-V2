@@ -795,12 +795,8 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                         popup_html_chart = fig.to_html(full_html=False, include_plotlyjs='cdn')
                         
                         # Reutilizar la lógica del popup
-                        popup_html = f"""
-                        <h4>{station_data[Config.STATION_NAME_COL]}</h4>
-                        <p><b>Municipio:</b> {station_data.get(Config.MUNICIPALITY_COL, 'N/A')}</p>
-                        <p><b>Altitud:</b> {station_data.get(Config.ALTITUDE_COL, 'N/A')} m</p>
-                        {popup_html_chart}
-                        """
+                        popup_html = generate_station_popup_html(station_data, df_anual_melted)
+                        popup_html += f"<hr>{popup_html_chart}"
                         
                         folium.Marker(location=[station_data['geometry'].y, station_data['geometry'].x],
                                       popup=folium.Popup(popup_html, max_width=400)).add_to(m)
@@ -957,11 +953,6 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                 all_selected_stations_info = \
                     gdf_filtered.drop_duplicates(subset=[Config.STATION_NAME_COL])
                 
-                full_grid = \
-                    pd.MultiIndex.from_product([all_selected_stations_info[Config.STATION_NAME_COL], all_years],
-                                               names=[Config.STATION_NAME_COL, Config.YEAR_COL]).to_frame(index=False)
-                
-                # CORRECCIÓN DE GEOMETRÍA: Aseguramos LAT/LON numéricas y el objeto GeoSeries
                 full_grid = pd.merge(full_grid, all_selected_stations_info[['geometry', Config.LATITUDE_COL, Config.LONGITUDE_COL,
                                         Config.STATION_NAME_COL]].drop_duplicates(), on=Config.STATION_NAME_COL)
                 
@@ -1063,7 +1054,6 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                     data_with_geom = pd.merge(data, gdf_stations_info, on=Config.STATION_NAME_COL)
                     
                     # CORRECCIÓN DE GEOPANDAS: Convertir a GeoDataFrame para usar total_bounds
-                    # Esto resuelve el error 'DataFrame' object has no attribute 'total_bounds'
                     gpd_data = gpd.GeoDataFrame(
                         data_with_geom, geometry='geometry', crs=gdf_stations_info.crs
                     ) 
@@ -1162,7 +1152,6 @@ def display_advanced_maps_tab(gdf_filtered, df_anual_melted, stations_for_analys
                         z_grid = interpolate_idw(lons, lats, vals.values, grid_lon, grid_lat)
                     elif method == "Spline (Thin Plate)":
                         # CORRECCIÓN DE INTERPOLACIÓN: Aseguramos el nombre de la función 'thin_plate'
-                        # El error de SciPy se debe a que 'thin_plate' debe ser una string en minúsculas.
                         rbf = Rbf(lons, lats, vals.values, function='thin_plate')
                         z_grid = rbf(grid_lon, grid_lat)
                         z_grid = z_grid.T # Transponer para Plotly
@@ -1678,7 +1667,7 @@ def display_correlation_tab(df_monthly_filtered, stations_for_analysis):
                     if p_value < 0.05:
                         st.success(f"La correlación es estadísticamente significativa (p<{p_value:.4f}).")
                     else:
-                        st.warning("La correlación no es estadísticamente significativa (p>={p_value:.4f}).")
+                        st.warning(f"La correlación no es estadísticamente significativa (p>={p_value:.4f}).")
 
                     fig_scatter_indices = px.scatter(
                         df_merged_indices, x=index_col_name, y=Config.PRECIPITATION_COL,
