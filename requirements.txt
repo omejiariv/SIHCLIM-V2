@@ -5,7 +5,7 @@ pandas==2.2.2
 scipy==1.13.1
 statsmodels==0.14.2
 pmdarima==2.0.4
-streamlit==1.35.0
+streamlit>=1.35.0
 streamlit-folium==0.18.0
 geopandas==0.14.4
 rasterio
@@ -21,9 +21,6 @@ openpyxl
 gstools==1.6.1
 fpdf2==2.7.8
 kaleido==0.2.1
-selenium==4.20.0
-webdriver-manager==4.0.1
-altair_saver==0.5.0
 Pillow==10.3.0
 openmeteo-requests
 requests-cache
@@ -31,3 +28,12 @@ retry-requests
 rich==13.7.1
 rasterstats
 cmdstanpy
+sqlalchemy
+psycopg2-binary
+geoalchemy2
+sqlalchemy
+supabase
+scikit-learn
+pykrige
+pysheds
+pyarrow

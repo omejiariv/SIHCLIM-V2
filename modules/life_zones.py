@@ -1,204 +1,236 @@
-# modules/life_zones.py
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
-from rasterio.warp import reproject, Resampling
-from rasterio.mask import mask
-from rasterio.transform import Affine
-from rasterio.features import rasterize
 import streamlit as st
-import math
-import os
+import io
+from contextlib import contextmanager
+from rasterio.features import rasterize, shapes
+from rasterio.io import MemoryFile
+from rasterio.warp import Resampling, calculate_default_transform, reproject
+from shapely.geometry import shape
 
-# --- Constantes ---
-LAPSE_RATE = 6.0
-BASE_TEMP_SEA_LEVEL = 28.0
-
-# --- Diccionario de Zonas de Vida (Según tabla Antioquia) ---
+# --- CONSTANTES Y DICCIONARIOS ---
 holdridge_zone_map_simplified = {
     "Nival": 1,
-    "Tundra pluvial alpino (tp-A)": 2, "Tundra húmeda alpino (th-A)": 3, "Tundra seca alpino (ts-A)": 4,
-    "Páramo pluvial subalpino (pp-SA)": 5, "Páramo muy húmedo subalpino (pmh-SA)": 6, "Páramo seco subalpino (ps-SA)": 7,
-    "Bosque pluvial Montano (bp-M)": 8, "Bosque muy húmedo Montano (bmh-M)": 9, "Bosque húmedo Montano (bh-M)": 10,
-    "Bosque seco Montano (bs-M)": 11, "Monte espinoso Montano (me-M)": 12,
-    "Bosque pluvial Premontano (bp-PM)": 13, "Bosque muy húmedo Premontano (bmh-PM)": 14, "Bosque húmedo Premontano (bh-PM)": 15,
-    "Bosque seco Premontano (bs-PM)": 16, "Monte espinoso Premontano (me-PM)": 17,
-    "Bosque pluvial Tropical (bp-T)": 18, "Bosque muy húmedo Tropical (bmh-T)": 19, "Bosque húmedo Tropical (bh-T)": 20,
-    "Bosque seco Tropical (bs-T)": 21, "Monte espinoso Tropical (me-T)": 22,
-    "Zona Desconocida": 0
+    "Tundra pluvial (tp-A)": 2,
+    "Tundra húmeda (th-A)": 3,
+    "Tundra seca (ts-A)": 4,
+    "Páramo pluvial subalpino (pp-SA)": 5,
+    "Páramo muy húmedo subalpino (pmh-SA)": 6,
+    "Páramo seco subalpino (ps-SA)": 7,
+    "Bosque pluvial Montano (bp-M)": 8,
+    "Bosque muy húmedo Montano (bmh-M)": 9,
+    "Bosque húmedo Montano (bh-M)": 10,
+    "Bosque seco Montano (bs-M)": 11,
+    "Monte espinoso Montano (me-M)": 12,
+    "Bosque pluvial Premontano (bp-PM)": 13,
+    "Bosque muy húmedo Premontano (bmh-PM)": 14,
+    "Bosque húmedo Premontano (bh-PM)": 15,
+    "Bosque seco Premontano (bs-PM)": 16,
+    "Monte espinoso Premontano (me-PM)": 17,
+    "Bosque pluvial Tropical (bp-T)": 18,
+    "Bosque muy húmedo Tropical (bmh-T)": 19,
+    "Bosque húmedo Tropical (bh-T)": 20,
+    "Bosque seco Tropical (bs-T)": 21,
+    "Monte espinoso Tropical (me-T)": 22,
+    "Zona Desconocida": 0,
 }
-holdridge_int_to_name_simplified = {v: k for k, v in holdridge_zone_map_simplified.items()}
 
+# Invertir para buscar nombre por ID
+holdridge_int_to_name_simplified = {
+    v: k for k, v in holdridge_zone_map_simplified.items()
+}
+
+# --- PALETA DE COLORES OFICIAL (HEX) ---
+holdridge_colors = {
+    1: "#FFFFFF",  # Nival
+    2: "#B0E0E6", 3: "#87CEEB", 4: "#708090",  # Alpino
+    5: "#8A2BE2", 6: "#9370DB", 7: "#D8BFD8",  # Páramo
+    8: "#00008B", 9: "#006400", 10: "#228B22", 11: "#9ACD32", 12: "#F0E68C",  # Montano
+    13: "#0000CD", 14: "#008000", 15: "#32CD32", 16: "#FFFF00", 17: "#DAA500",  # Premontano
+    18: "#191970", 19: "#2E8B57", 20: "#7CFC00", 21: "#FFA500", 22: "#FF4500",  # Tropical
+    0: "#000000",
+}
+
+# --- FUNCIÓN AUXILIAR PARA ABRIR RASTERS (RUTA O MEMORIA) ---
+@contextmanager
+def open_raster_source(source):
+    """
+    Context manager inteligente:
+    - Si source es bytes/BytesIO: Usa MemoryFile.
+    - Si source es string (ruta): Usa rasterio.open estándar.
+    """
+    if isinstance(source, (io.BytesIO, bytes)) or hasattr(source, 'read'):
+        with MemoryFile(source) as memfile:
+            with memfile.open() as src:
+                yield src
+    else:
+        with rasterio.open(source) as src:
+            yield src
 
 def classify_life_zone_alt_ppt(altitude, ppt):
-    """
-    Clasifica una celda según su altitud (m) y precipitacion anual (mm).
-    Devuelve el id de zona (int) o 0 si no aplicable.
-    """
+    """Clasifica una celda según su altitud (m) y precipitación anual (mm)."""
     if pd.isna(altitude) or pd.isna(ppt) or altitude < 0 or ppt <= 0:
         return 0
 
-    if altitude > 4200:
-        return 1
-    if altitude >= 3700:
-        if ppt >= 1500:
-            return 2
-        elif ppt >= 750:
-            return 3
-        else:
-            return 4
-    if altitude >= 3200:
-        if ppt >= 2000:
-            return 5
-        elif ppt >= 1000:
-            return 6
-        else:
-            return 7
+    # Lógica de clasificación (Misma que proporcionaste)
+    if altitude >= 4500: return 1
+    if altitude >= 3800: return 2 if ppt >= 1000 else (3 if ppt >= 500 else 4)
+    if altitude >= 3000: return 5 if ppt >= 2000 else (6 if ppt >= 1000 else 7)
     if altitude >= 2000:
-        if ppt >= 4000:
-            return 8
-        elif ppt >= 2000:
-            return 9
-        elif ppt >= 1000:
-            return 10
-        elif ppt >= 500:
-            return 11
-        else:
-            return 12
+        if ppt >= 4000: return 8
+        elif ppt >= 2000: return 9
+        elif ppt >= 1000: return 10
+        elif ppt >= 500: return 11
+        else: return 12
     if altitude >= 1000:
-        if ppt >= 4000:
-            return 13
-        elif ppt >= 2000:
-            return 14
-        elif ppt >= 1000:
-            return 15
-        elif ppt >= 500:
-            return 16
-        else:
-            return 17
-    # altitude < 1000
-    if ppt >= 4000:
-        return 18
-    if ppt >= 2000:
-        return 19
-    if ppt >= 1000:
-        return 20
-    if ppt >= 500:
-        return 21
-    return 22
+        if ppt >= 4000: return 13
+        elif ppt >= 2000: return 14
+        elif ppt >= 1000: return 15
+        elif ppt >= 500: return 16
+        else: return 17
+    # Tropical
+    if ppt >= 8000: return 18
+    elif ppt >= 4000: return 19
+    elif ppt >= 2000: return 20
+    elif ppt >= 1000: return 21
+    else: return 22
+
+_vectorized_classify = np.vectorize(classify_life_zone_alt_ppt)
 
 
-def _resample_raster_to_shape(src_dataset, dst_shape, dst_transform, dst_crs=None, resampling=Resampling.average):
+def generate_life_zone_map(dem_input, ppt_input, mask_geometry=None, downscale_factor=4):
     """
-    Reproyecta/resamplea la banda 1 del dataset src_dataset a un array con
-    dimensión dst_shape y transform dst_transform. Si dst_crs es None usa src_dataset.crs.
-    Retorna el array resampleado (float32).
-    """
-    dest = np.empty(dst_shape, dtype=np.float32)
-    src_nodata = src_dataset.nodata
-    if dst_crs is None:
-        dst_crs = src_dataset.crs
-
-    reproject(
-        source=rasterio.band(src_dataset, 1),
-        destination=dest,
-        src_transform=src_dataset.transform,
-        src_crs=src_dataset.crs,
-        src_nodata=src_nodata,
-        dst_transform=dst_transform,
-        dst_crs=dst_crs,
-        dst_nodata=np.nan,
-        resampling=resampling
-    )
-    return dest
-
-
-def generate_life_zone_map(dem_path, precip_raster_path, mask_geometry=None, downscale_factor=4):
-    """
-    Genera un mapa raster clasificado de Zonas de Vida usando Altitud (DEM) y PPT (raster de precipitación).
-    - dem_path, precip_raster_path: rutas a GeoTIFFs.
-    - mask_geometry: GeoDataFrame (opcional) con geometría para recortar (en CRS del DEM).
-    - downscale_factor: entero >=1; mayor valor = resolución más baja (menos memoria).
-    Retorna: (classified_raster (2D numpy int16), output_profile (dict), mapping int->name)
+    Genera mapa raster clasificado de Zonas de Vida.
+    Soporta entradas como rutas de archivo O como objetos BytesIO (Supabase).
     """
     try:
         if downscale_factor is None or downscale_factor <= 0:
             downscale_factor = 1
+        dst_crs = "EPSG:4326"
 
-        # --- Abrir DEM y calcular rejilla destino ---
-        with rasterio.open(dem_path) as dem_src:
-            src_width = dem_src.width
-            src_height = dem_src.height
-            src_transform = dem_src.transform
-            dem_crs = dem_src.crs
-            nodata_dem = dem_src.nodata
+        # 1. Procesar DEM (Usando el helper inteligente)
+        with open_raster_source(dem_input) as dem_src:
+            dst_width = max(1, dem_src.width // downscale_factor)
+            dst_height = max(1, dem_src.height // downscale_factor)
 
-            dst_width = max(1, src_width // downscale_factor)
-            dst_height = max(1, src_height // downscale_factor)
+            dst_transform, dst_width, dst_height = calculate_default_transform(
+                dem_src.crs, dst_crs, dem_src.width, dem_src.height, 
+                *dem_src.bounds, dst_width=dst_width, dst_height=dst_height
+            )
 
-            # nuevo transform escalado correctamente
-            scale_x = src_width / dst_width
-            scale_y = src_height / dst_height
-            dst_transform = src_transform * Affine.scale(scale_x, scale_y)
+            dem_resampled = np.empty((dst_height, dst_width), dtype=np.float32)
+            reproject(
+                source=rasterio.band(dem_src, 1),
+                destination=dem_resampled,
+                src_transform=dem_src.transform,
+                src_crs=dem_src.crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+            )
 
-            dem_resampled = _resample_raster_to_shape(dem_src, (dst_height, dst_width), dst_transform, dst_crs=dem_crs, resampling=Resampling.bilinear)
+        # 2. Procesar Precipitación
+        with open_raster_source(ppt_input) as ppt_src:
+            ppt_resampled = np.empty((dst_height, dst_width), dtype=np.float32)
+            reproject(
+                source=rasterio.band(ppt_src, 1),
+                destination=ppt_resampled,
+                src_transform=ppt_src.transform,
+                src_crs=ppt_src.crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.average,
+            )
 
-        # --- Abrir precipitación y remuestrear a la misma rejilla y CRS del DEM ---
-        with rasterio.open(precip_raster_path) as ppt_src:
-            # Nota crítica: forzamos dst_crs = dem_crs para que ambos arrays estén alineados espacialmente
-            ppt_resampled = _resample_raster_to_shape(ppt_src, (dst_height, dst_width), dst_transform, dst_crs=dem_crs, resampling=Resampling.average)
-
-        # --- Valid mask para píxeles donde tanto DEM como PPT tienen valores válidos ---
+        # 3. Clasificación
         dem_mask = np.isnan(dem_resampled)
         ppt_mask = np.isnan(ppt_resampled)
-        valid_mask = (~dem_mask) & (~ppt_mask) & np.isfinite(ppt_resampled)
+        valid_mask = (~dem_mask) & (~ppt_mask) & (dem_resampled > -500) & (ppt_resampled >= 0)
 
         classified_raster = np.zeros((dst_height, dst_width), dtype=np.int16)
 
         if np.any(valid_mask):
-            alt_values = dem_resampled[valid_mask]
-            ppt_values = ppt_resampled[valid_mask]
-
-            # Vectorizar clasificación
-            vectorized_classify = np.vectorize(classify_life_zone_alt_ppt)
-            zone_ints = vectorized_classify(alt_values, ppt_values)
+            zone_ints = _vectorized_classify(
+                dem_resampled[valid_mask], ppt_resampled[valid_mask]
+            )
             classified_raster[valid_mask] = zone_ints.astype(np.int16)
 
-        # Aplicar máscara de geometría (si se provee)
+        # 4. Máscara Geometría
         if mask_geometry is not None and not mask_geometry.empty:
             try:
-                # Reproyectar la geometría al CRS del DEM si es necesario
-                if hasattr(mask_geometry, "crs") and mask_geometry.crs and dem_crs and mask_geometry.crs != dem_crs:
-                    mask_reproj = mask_geometry.to_crs(dem_crs)
-                else:
-                    mask_reproj = mask_geometry
-                shapes = [(geom, 1) for geom in mask_reproj.geometry]
+                mask_reproj = (
+                    mask_geometry.to_crs(dst_crs)
+                    if mask_geometry.crs != dst_crs
+                    else mask_geometry
+                )
+                shapes_list = [(geom, 1) for geom in mask_reproj.geometry]
                 mask_raster = rasterize(
-                    shapes,
+                    shapes_list,
                     out_shape=(dst_height, dst_width),
                     transform=dst_transform,
                     fill=0,
-                    dtype=np.uint8
+                    dtype=np.uint8,
                 )
                 classified_raster = np.where(mask_raster == 1, classified_raster, 0)
-            except Exception as e_mask:
-                st.warning(f"No se pudo aplicar la máscara de geometría: {e_mask}")
+            except Exception as e:
+                st.warning(f"Error máscara: {e}")
 
+        # 5. Perfil de salida
         output_profile = {
-            'driver': 'GTiff',
-            'dtype': rasterio.int16,
-            'nodata': 0,
-            'width': dst_width,
-            'height': dst_height,
-            'count': 1,
-            'crs': dem_crs,
-            'transform': dst_transform
+            "driver": "GTiff",
+            "dtype": "int16",
+            "nodata": 0,
+            "width": dst_width,
+            "height": dst_height,
+            "count": 1,
+            "crs": dst_crs,
+            "transform": dst_transform,
+            "compress": "lzw",
         }
 
-        return classified_raster, output_profile, holdridge_int_to_name_simplified
+        return (
+            classified_raster,
+            output_profile,
+            holdridge_int_to_name_simplified,
+            holdridge_colors,
+        )
 
     except Exception as e:
-        st.error(f"Error generando mapa de zonas de vida: {e}")
-        import traceback
-        st.error(traceback.format_exc())
-        return None, None, None
+        st.error(f"Error generando mapa: {e}")
+        return None, None, None, None
+
+def vectorize_raster_to_gdf(raster_array, transform, crs):
+    """Convierte el Raster clasificado a GeoDataFrame."""
+    try:
+        mask = raster_array != 0
+        results = (
+            {"properties": {"id_zona": v}, "geometry": s}
+            for i, (s, v) in enumerate(shapes(raster_array, mask=mask, transform=transform))
+        )
+        geoms = []
+        ids = []
+        for r in results:
+            geoms.append(shape(r["geometry"]))
+            ids.append(r["properties"]["id_zona"])
+
+        if not geoms: return gpd.GeoDataFrame()
+
+        gdf = gpd.GeoDataFrame({"id_zona": ids}, geometry=geoms, crs=crs)
+        gdf["zona_vida"] = gdf["id_zona"].map(holdridge_int_to_name_simplified)
+        return gdf
+    except Exception as e:
+        st.error(f"Error vectorizando mapa: {e}")
+        return gpd.GeoDataFrame()
+
+def get_raster_bytes(raster_array, profile):
+    """Escribe el array raster a un objeto BytesIO (memoria)."""
+    try:
+        mem_file = MemoryFile()
+        with mem_file.open(**profile) as dataset:
+            dataset.write(raster_array, 1)
+        return mem_file.read()
+    except Exception as e:
+        st.error(f"Error preparando descarga TIFF: {e}")
+        return None

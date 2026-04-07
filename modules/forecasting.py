@@ -1,399 +1,268 @@
-import requests
+# modules/forecasting.py
+
+import numpy as np
+import pandas as pd
 import pmdarima as pm
 import streamlit as st
-import pandas as pd
-from statsmodels.tsa.seasonal import seasonal_decompose
-from statsmodels.tsa.stattools import pacf, acf
-from statsmodels.tsa.statespace.sarimax import SARIMAX
 from prophet import Prophet
-import plotly.graph_objects as go
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import acf, pacf
+
 from modules.config import Config
-from pandas.tseries.offsets import DateOffset
-from datetime import datetime
 
-# modules/forecast_api.py
-
-import streamlit as st
-import openmeteo_requests
-import requests_cache
-import pandas as pd
-from retry_requests import retry
-
-@st.cache_data(ttl=3600) # Cache por 1 hora
-def get_weather_forecast(latitude, longitude):
-    """Obtiene el pronóstico del tiempo para 7 días con variables adicionales."""
-    cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
-    openmeteo = openmeteo_requests.Client(session=retry_session)
-
-    url = "https://api.open-meteo.com/v1/forecast"
-    
-    # --- Variables a solicitar ---
-    daily_variables = [
-        "temperature_2m_max",               # Temperatura máxima a 2m (°C)
-        "temperature_2m_min",               # Temperatura mínima a 2m (°C)
-        "precipitation_sum",                # Suma de precipitación diaria (mm)
-        "relative_humidity_2m_mean",        # Humedad relativa media a 2m (%)
-        "surface_pressure_mean",            # Presión superficial media (hPa) - Usamos esta en lugar de MSL para pronóstico
-        "et0_fao_evapotranspiration",       # Evapotranspiración de referencia (mm)
-        "shortwave_radiation_sum",          # Suma de radiación de onda corta diaria (MJ/m²)
-        "wind_speed_10m_max"                # Velocidad máxima del viento a 10m (km/h o m/s, verificar unidad)
-        # "precipitable_water"             # Agua precipitable (mm) - Si está disponible para diario
-    ]
-    # Nota: "Intensidad lumínica" (lux) no suele estar disponible directamente. Usamos radiación solar.
-    # Nota: Vapor de agua se aproxima con Agua Precipitable si está disponible, o Humedad Relativa.
-
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "daily": daily_variables, # Lista actualizada de variables
-        "timezone": "auto",
-        "forecast_days": 7 # Aseguramos que sean 7 días
-    }
-
-    try:
-        responses = openmeteo.weather_api(url, params=params)
-        response = responses[0]
-
-        # Procesar la respuesta
-        daily = response.Daily()
-        if daily is None:
-             st.error("La API no devolvió datos diarios.")
-             return None
-             
-        timezone_str = response.Timezone().decode('utf-8')
-        
-        # --- Diccionario para construir el DataFrame ---
-        daily_data = {
-            "date": pd.to_datetime(daily.Time(), unit="s", utc=True).tz_convert(timezone_str)
-        }
-        
-        # Iterar sobre las variables solicitadas para extraer los datos
-        num_variables = daily.VariablesLength()
-        if num_variables != len(daily_variables):
-             st.warning(f"La API devolvió {num_variables} variables, pero se solicitaron {len(daily_variables)}. Algunas podrían faltar.")
-             # Aun así intentamos procesar las que sí llegaron
-        
-        # Mapeo manual para asegurar el orden y manejar posibles faltantes
-        variable_map = {var: i for i, var in enumerate(daily_variables)}
-        
-        if variable_map.get("temperature_2m_max", -1) < num_variables and variable_map.get("temperature_2m_max", -1) != -1:
-            daily_data["temperature_2m_max"] = daily.Variables(variable_map["temperature_2m_max"]).ValuesAsNumpy()
-        if variable_map.get("temperature_2m_min", -1) < num_variables and variable_map.get("temperature_2m_min", -1) != -1:
-            daily_data["temperature_2m_min"] = daily.Variables(variable_map["temperature_2m_min"]).ValuesAsNumpy()
-        if variable_map.get("precipitation_sum", -1) < num_variables and variable_map.get("precipitation_sum", -1) != -1:
-            daily_data["precipitation_sum"] = daily.Variables(variable_map["precipitation_sum"]).ValuesAsNumpy()
-        if variable_map.get("relative_humidity_2m_mean", -1) < num_variables and variable_map.get("relative_humidity_2m_mean", -1) != -1:
-            daily_data["relative_humidity_2m_mean"] = daily.Variables(variable_map["relative_humidity_2m_mean"]).ValuesAsNumpy()
-        if variable_map.get("surface_pressure_mean", -1) < num_variables and variable_map.get("surface_pressure_mean", -1) != -1:
-            daily_data["surface_pressure_mean"] = daily.Variables(variable_map["surface_pressure_mean"]).ValuesAsNumpy()
-        if variable_map.get("et0_fao_evapotranspiration", -1) < num_variables and variable_map.get("et0_fao_evapotranspiration", -1) != -1:
-            daily_data["et0_fao_evapotranspiration"] = daily.Variables(variable_map["et0_fao_evapotranspiration"]).ValuesAsNumpy()
-        if variable_map.get("shortwave_radiation_sum", -1) < num_variables and variable_map.get("shortwave_radiation_sum", -1) != -1:
-            daily_data["shortwave_radiation_sum"] = daily.Variables(variable_map["shortwave_radiation_sum"]).ValuesAsNumpy()
-        if variable_map.get("wind_speed_10m_max", -1) < num_variables and variable_map.get("wind_speed_10m_max", -1) != -1:
-            daily_data["wind_speed_10m_max"] = daily.Variables(variable_map["wind_speed_10m_max"]).ValuesAsNumpy()
-
-        # Crear DataFrame y devolverlo
-        forecast_df = pd.DataFrame(data=daily_data)
-        # Asegurarse de que solo tenemos 7 días si la API devuelve más
-        return forecast_df.head(7) 
-
-    except openmeteo_requests.ApiError as e: # Catch specific API errors
-        st.error(f"Error de la API de Open-Meteo: {e}")
-        return None
-    except Exception as e:
-        st.error(f"Ocurrió un error inesperado al obtener el pronóstico: {e}")
-        return None
-
-@st.cache_data(ttl=86400) # Cachear por 1 día
-def get_official_enso_forecast():
-    """
-    Descarga y procesa el pronóstico consolidado de ENSO (IRI/CPC)
-    desde la fuente de datos JSON oficial.
-    
-    Esta función es robusta contra los bloqueos de HTML/TSV.
-    
-    Retorna:
-        - df_prophet: DataFrame listo para Prophet (cols 'ds', 'anomalia_oni')
-        - df_sarima: DataFrame listo para SARIMA (cols 'fecha_mes_año', 'anomalia_oni')
-    """
-    try:
-        # --- NUEVA FUENTE DE DATOS: JSON ---
-        DATA_URL = "https://iri.columbia.edu/our-expertise/climate/forecasts/enso/graphics/ensoplume_full.json"
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
-        }
-        
-        response = requests.get(DATA_URL, headers=headers)
-        response.raise_for_status()
-        json_data = response.json()
-
-        # --- PARSEO DEL JSON ---
-        
-        # 1. Obtener los datos del pronóstico (usamos el modelo estadístico de IRI)
-        # Los datos vienen como [ [año_decimal, valor], [año_decimal, valor], ... ]
-        forecast_data = json_data.get('stat_fcst', {}).get('IRI-AI', [])
-        if not forecast_data:
-            raise ValueError("No se encontró la clave 'IRI-AI' en el JSON del pronóstico.")
-            
-        df_forecast = pd.DataFrame(forecast_data, columns=['year_decimal', 'anomalia_oni'])
-        
-        # 2. Convertir año decimal a datetime
-        # (ej. 2025.5 -> 2025 + 0.5 * 12 = mes 6 (Junio))
-        def decimal_year_to_datetime(dec_year):
-            year = int(dec_year)
-            month_decimal = (dec_year - year) * 12
-            # El pronóstico es estacional (3 meses), lo centramos
-            month = int(round(month_decimal)) + 1 
-            if month > 12: # Manejar redondeo de fin de año
-                year += 1
-                month = 1
-            return datetime(year, month, 1)
-
-        df_forecast['ds'] = df_forecast['year_decimal'].apply(decimal_year_to_datetime)
-        
-        # 3. Limpiar y seleccionar
-        df_clean = df_forecast[['ds', 'anomalia_oni']].sort_values(by='ds').drop_duplicates()
-
-        # 4. Interpolar a frecuencia mensual ('MS')
-        df_clean = df_clean.set_index('ds')
-        date_range = pd.date_range(start=df_clean.index.min(), end=df_clean.index.max(), freq='MS')
-        
-        df_monthly = df_clean.reindex(date_range)
-        # Rellenar los meses faltantes (ej. Enero) usando interpolación lineal
-        df_monthly['anomalia_oni'] = df_monthly['anomalia_oni'].interpolate(method='linear', limit_direction='both')
-        
-        df_monthly = df_monthly.reset_index().rename(columns={'index': 'ds'})
-
-        # 5. Preparar los DataFrames de salida
-        df_prophet_out = df_monthly.rename(columns={'anomalia_oni': Config.ENSO_ONI_COL})
-        
-        df_sarima_out = df_monthly.rename(
-            columns={'ds': Config.DATE_COL, 'anomalia_oni': Config.ENSO_ONI_COL}
-        )
-        
-        return df_prophet_out, df_sarima_out
-        
-    except Exception as e:
-        st.error(f"Error al descargar el pronóstico oficial del ENSO: {e}")
-        st.exception(e) # Imprimir el traceback completo para depuración
-        return None, None
-        
-@st.cache_data(show_spinner=False)
-def get_decomposition_results(series, period=12, model='additive'):
-    """Realiza la descomposición de la serie de tiempo."""
-    series_clean = series.asfreq('MS').interpolate(method='time').dropna()
-    if len(series_clean) < 2 * period:
-        raise ValueError("Serie demasiado corta o con demasiados nulos para la descomposición.")
-    return seasonal_decompose(series_clean, model=model, period=period)
-
-def create_acf_chart(series, max_lag):
-    """Genera el gráfico de la Función de Autocorrelación (ACF) usando Plotly."""
-    if len(series) <= max_lag:
-        return go.Figure().update_layout(title="Datos insuficientes para ACF")
-
-    acf_values = acf(series, nlags=max_lag)
-    lags = list(range(max_lag + 1))
-    conf_interval = 1.96 / np.sqrt(len(series))
-    
-    fig_acf = go.Figure(data=[
-        go.Bar(x=lags, y=acf_values, name='ACF'),
-        go.Scatter(x=lags, y=[conf_interval] * (max_lag + 1), mode='lines', line=dict(color='blue', dash='dash'), name='Límite de Confianza'),
-        go.Scatter(x=lags, y=[-conf_interval] * (max_lag + 1), mode='lines', line=dict(color='blue', dash='dash'), fill='tonexty', fillcolor='rgba(0,0,255,0.1)', showlegend=False)
-    ])
-    fig_acf.update_layout(title='Función de Autocorrelación (ACF)', xaxis_title='Rezagos (Meses)', yaxis_title='Correlación', height=400)
-    return fig_acf
-
-def create_pacf_chart(series, max_lag):
-    """Genera el gráfico de la Función de Autocorrelación Parcial (PACF) usando Plotly."""
-    if len(series) <= max_lag:
-        return go.Figure().update_layout(title="Datos insuficientes para PACF")
-
-    pacf_values = pacf(series, nlags=max_lag)
-    lags = list(range(max_lag + 1))
-    conf_interval = 1.96 / np.sqrt(len(series))
-
-    fig_pacf = go.Figure(data=[
-        go.Bar(x=lags, y=pacf_values, name='PACF'),
-        go.Scatter(x=lags, y=[conf_interval] * (max_lag + 1), mode='lines', line=dict(color='red', dash='dash'), name='Límite de Confianza'),
-        go.Scatter(x=lags, y=[-conf_interval] * (max_lag + 1), mode='lines', line=dict(color='red', dash='dash'), fill='tonexty', fillcolor='rgba(255,0,0,0.1)', showlegend=False)
-    ])
-    fig_pacf.update_layout(title='Función de Autocorrelación Parcial (PACF)', xaxis_title='Rezagos (Meses)', yaxis_title='Correlación', height=400)
-    return fig_pacf
 
 def evaluate_forecast(y_true, y_pred):
-    """Calcula RMSE y MAE para evaluar un pronóstico."""
+    """Calcula métricas de error."""
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     mae = mean_absolute_error(y_true, y_pred)
-    return {'RMSE': rmse, 'MAE': mae}
+    return {"RMSE": rmse, "MAE": mae}
 
-# --- INICIO DE LA CORRECCIÓN ---
+
+def get_decomposition_results(series, period=12, model="additive"):
+    """Descompone la serie de tiempo."""
+    # Asegurar integridad
+    series_clean = series.asfreq("MS").interpolate(method="time").dropna()
+    if len(series_clean) < period * 2:
+        raise ValueError("Serie muy corta para descomposición estacional.")
+    return seasonal_decompose(series_clean, model=model, period=period)
+
+
+def create_acf_chart(series, max_lag):
+    import plotly.graph_objects as go
+
+    try:
+        acf_vals = acf(series, nlags=max_lag)
+        fig = go.Figure(data=[go.Bar(x=list(range(len(acf_vals))), y=acf_vals)])
+        fig.update_layout(
+            title="Autocorrelación (ACF)",
+            xaxis_title="Lag",
+            yaxis_title="ACF",
+            height=350,
+        )
+        return fig
+    except:
+        return go.Figure()
+
+
+def create_pacf_chart(series, max_lag):
+    import plotly.graph_objects as go
+
+    try:
+        pacf_vals = pacf(series, nlags=max_lag)
+        fig = go.Figure(data=[go.Bar(x=list(range(len(pacf_vals))), y=pacf_vals)])
+        fig.update_layout(
+            title="Autocorrelación Parcial (PACF)",
+            xaxis_title="Lag",
+            yaxis_title="PACF",
+            height=350,
+        )
+        return fig
+    except:
+        return go.Figure()
+
+
+@st.cache_data(show_spinner=False)
+def auto_arima_search(ts_data, test_size):
+    train = ts_data[:-test_size]
+    model = pm.auto_arima(
+        train,
+        start_p=0,
+        start_q=0,
+        m=12,
+        seasonal=True,
+        trace=False,
+        error_action="ignore",
+    )
+    return model.order, model.seasonal_order
+
+
 @st.cache_data
-def generate_sarima_forecast(ts_data_raw, order, seasonal_order, horizon, test_size=12, regressors=None):
-    """Entrena, evalúa y genera un pronóstico con SARIMAX, incluyendo regresores opcionales."""
-    ts_data = ts_data_raw[[Config.DATE_COL, Config.PRECIPITATION_COL]].copy()
-    ts_data = ts_data.drop_duplicates(subset=[Config.DATE_COL], keep='first')
-    ts_data = ts_data.set_index(Config.DATE_COL).sort_index()
-    ts = ts_data[Config.PRECIPITATION_COL].asfreq('MS').interpolate(method='time').dropna()
+def generate_sarima_forecast(
+    ts_data_raw, order, seasonal_order, horizon, test_size=12, regressors=None
+):
+    """
+    Pronóstico SARIMA con soporte para regresores exógenos.
+    BLINDADO: Maneja índices y cruces de datos para evitar errores de límites.
+    """
+    # 1. Preparar Serie Principal
+    df = ts_data_raw.copy()
+    # Asegurar nombre de columna de fecha
+    if Config.DATE_COL not in df.columns:
+        # Intentar encontrar la columna de fecha
+        cols = df.columns
+        # Si hay una columna llamada 'index' o similar que parece fecha
+        if "index" in cols:
+            df = df.rename(columns={"index": Config.DATE_COL})
+        elif "ds" in cols:
+            df = df.rename(columns={"ds": Config.DATE_COL})
 
-    if len(ts) < test_size + 24:
-        raise ValueError(f"Se necesitan al menos {test_size + 24} meses de datos para el pronóstico y la evaluación.")
+    # Convertir a datetime y setear indice
+    df[Config.DATE_COL] = pd.to_datetime(df[Config.DATE_COL])
+    df = df.set_index(Config.DATE_COL).sort_index()
 
-    exog, exog_train, exog_test, exog_future = None, None, None, None
+    # Extraer serie y limpiar
+    ts = df[Config.PRECIPITATION_COL].asfreq("MS").interpolate(method="time").dropna()
+
+    if len(ts) < 24:
+        raise ValueError("Serie de tiempo insuficiente tras limpieza (<24 meses).")
+
+    # 2. Preparar Regresores (Exógenos)
+    exog_train = None
+    exog_test = None
+    exog_future = None
+    exog_full = None
+
     if regressors is not None and not regressors.empty:
-        exog = regressors.set_index(Config.DATE_COL)
-        exog = exog.reindex(ts.index).interpolate()
+        try:
+            # Asegurar índice fecha en regresores
+            reg_clean = regressors.copy()
+            if Config.DATE_COL in reg_clean.columns:
+                reg_clean = reg_clean.set_index(Config.DATE_COL)
+            elif "ds" in reg_clean.columns:
+                reg_clean = reg_clean.set_index("ds")
 
-    train, test = ts[:-test_size], ts[-test_size:]
-    if exog is not None:
-        exog_train, exog_test = exog.iloc[:-test_size], exog.iloc[-test_size:]
+            reg_clean = (
+                reg_clean.sort_index()
+                .asfreq("MS")
+                .interpolate(method="time")
+                .bfill()
+                .ffill()
+            )
 
-    model = SARIMAX(train, order=order, seasonal_order=seasonal_order, exog=exog_train, enforce_stationarity=False, enforce_invertibility=False)
-    results = model.fit(disp=False)
-    pred_test = results.get_forecast(steps=test_size, exog=exog_test)
-    y_pred_test = pred_test.predicted_mean
-    metrics = evaluate_forecast(test, y_pred_test)
+            # Alinear con la serie histórica (intersección)
+            # Esto es clave: solo usamos los tiempos donde existen ambos datos
+            common_idx = ts.index.intersection(reg_clean.index)
+            if (
+                len(common_idx) < len(ts) * 0.8
+            ):  # Si perdemos muchos datos, mejor no usar regresor
+                pass
+            else:
+                exog_full = reg_clean.loc[ts.index]
 
-    if exog is not None:
-        last_regressor_values = exog.iloc[-1:].values
-        future_index = pd.date_range(start=ts.index[-1] + pd.DateOffset(months=1), periods=horizon, freq='MS')
-        exog_future = pd.DataFrame(np.tile(last_regressor_values, (horizon, 1)), index=future_index, columns=exog.columns)
+                # Preparar futuro
+                last_date = ts.index[-1]
+                future_dates = pd.date_range(
+                    start=last_date + pd.DateOffset(months=1),
+                    periods=horizon,
+                    freq="MS",
+                )
+                # Verificar si tenemos regresores para el futuro
+                if future_dates.isin(reg_clean.index).all():
+                    exog_future = reg_clean.loc[future_dates]
+                else:
+                    # Si falta futuro, no podemos usar regresores para pronosticar
+                    exog_full = None
+        except:
+            exog_full = None  # Fallback seguro
 
-    full_model = SARIMAX(ts, order=order, seasonal_order=seasonal_order, exog=exog, enforce_stationarity=False, enforce_invertibility=False)
-    full_results = full_model.fit(disp=False)
-    forecast = full_results.get_forecast(steps=horizon, exog=exog_future)
+    # 3. Split
+    # Asegurar que test_size no rompa la serie
+    real_test_size = min(test_size, int(len(ts) * 0.2))
 
-    forecast_mean = forecast.predicted_mean
-    forecast_ci = forecast.conf_int()
-    
-    # La variable 'sarima_df_export' ahora siempre se define
-    sarima_df_export = forecast_mean.reset_index().rename(columns={'index': 'ds', 'predicted_mean': 'yhat'})
+    train = ts.iloc[:-real_test_size]
+    test = ts.iloc[-real_test_size:]
 
-    return ts, forecast_mean, forecast_ci, metrics, sarima_df_export
-# --- FIN DE LA CORRECCIÓN ---
+    if exog_full is not None:
+        exog_train = exog_full.iloc[:-real_test_size]
+        exog_test = exog_full.iloc[-real_test_size:]
+
+    # 4. Modelo (Train)
+    model = SARIMAX(
+        train,
+        order=order,
+        seasonal_order=seasonal_order,
+        exog=exog_train,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    res = model.fit(disp=False)
+
+    # Evaluar
+    pred = res.get_forecast(steps=len(test), exog=exog_test)
+    metrics = evaluate_forecast(test, pred.predicted_mean)
+
+    # 5. Modelo Final (Full)
+    full_model = SARIMAX(
+        ts,
+        order=order,
+        seasonal_order=seasonal_order,
+        exog=exog_full,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    full_res = full_model.fit(disp=False)
+
+    # Pronóstico Futuro
+    # Si tenemos regresores futuros, los usamos. Si no, pronóstico simple.
+    final_forecast = full_res.get_forecast(steps=horizon, exog=exog_future)
+
+    fc_val = final_forecast.predicted_mean
+    ci = final_forecast.conf_int()
+
+    return ts, fc_val, ci, metrics, fc_val.reset_index()
+
 
 @st.cache_data
 def generate_prophet_forecast(ts_data_raw, horizon, test_size=12, regressors=None):
-    """Entrena, evalúa y genera un pronóstico con Prophet, incluyendo regresores opcionales."""
-    
-    # 1. Preparar datos de precipitación
-    ts_data = ts_data_raw.rename(columns={Config.DATE_COL: 'ds', Config.PRECIPITATION_COL: 'y'})
-    ts_data = ts_data.drop_duplicates(subset=['ds'], keep='first')
-    
-    # Corrección para 'ValueError: time-weighted interpolation'
-    ts_data['ds'] = pd.to_datetime(ts_data['ds'])
-    ts_data = ts_data.set_index('ds')
-    ts_data['y'] = ts_data['y'].interpolate(method='time')
-    ts_data = ts_data.reset_index()
+    """Pronóstico Prophet con regresores."""
+    # Preparar
+    df = ts_data_raw.rename(
+        columns={Config.DATE_COL: "ds", Config.PRECIPITATION_COL: "y"}
+    )
+    df["ds"] = pd.to_datetime(df["ds"])
+    df = df.sort_values("ds").dropna(subset=["y"])
 
-    if len(ts_data) < test_size + 24:
-        raise ValueError(f"Se necesitan al menos {test_size + 24} meses de datos para Prophet.")
+    if len(df) < 24:
+        raise ValueError("Datos insuficientes para Prophet.")
 
-    # 2. Inicializar el modelo de *evaluación*
-    model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
-
-    # 3. Preparar regresores (si existen)
-    regressor_cols = []
+    # Regresores
+    reg_cols = []
     if regressors is not None and not regressors.empty:
-        
-        # --- INICIO DE LA CORRECCIÓN PARA 'KeyError: anomalia_oni' ---
-        
-        # 1. Obtener la lista de nombres de regresores (ej: ['anomalia_oni'])
-        regressor_names = [col for col in regressors.columns if col != 'ds']
-        
-        # 2. Eliminar esas columnas de ts_data (los datos históricos)
-        #    para evitar un conflicto de merge (col_x, col_y)
-        cols_to_drop_from_ts = [col for col in regressor_names if col in ts_data.columns]
-        if cols_to_drop_from_ts:
-            ts_data = ts_data.drop(columns=cols_to_drop_from_ts)
-        
-        # 3. Ahora el merge es limpio. 'ts_data' solo tendrá una columna 'anomalia_oni' (la del pronóstico).
-        ts_data = pd.merge(ts_data, regressors, on='ds', how='left')
-        
-        # 4. Iterar sobre los nombres de regresores (ej: 'anomalia_oni')
-        for col in regressor_names:
-            # Interpolar el regresor (que ahora es el pronosticado)
-            ts_data[col] = ts_data[col].interpolate(method='linear', limit_direction='both')
-            model.add_regressor(col)
-            regressor_cols.append(col)
-        # --- FIN DE LA CORRECCIÓN ---
+        r = regressors.copy()
+        if "ds" not in r.columns and Config.DATE_COL in r.columns:
+            r = r.rename(columns={Config.DATE_COL: "ds"})
 
-    # 4. Dividir datos y entrenar modelo de evaluación
-    train, test = ts_data.iloc[:-test_size], ts_data.iloc[-test_size:]
-    model.fit(train)
+        # Merge
+        df = pd.merge(df, r, on="ds", how="left")
+        reg_cols = [c for c in r.columns if c != "ds"]
+        # Llenar huecos
+        for c in reg_cols:
+            df[c] = df[c].interpolate(method="linear").bfill().ffill()
+        # Limpiar filas que sigan con nulos en regresores
+        df = df.dropna()
 
-    # 5. Evaluar modelo
-    test_dates = model.make_future_dataframe(periods=test_size, freq='MS').tail(test_size)
-    if regressor_cols: 
-        test_regressors = ts_data[ts_data['ds'].isin(test_dates['ds'])][['ds'] + regressor_cols]
-        test_dates = pd.merge(test_dates, test_regressors, on='ds', how='left')
-        test_dates[regressor_cols] = test_dates[regressor_cols].interpolate(method='linear', limit_direction='both')
-    
-    y_pred_test = model.predict(test_dates)['yhat']
-    metrics = evaluate_forecast(test['y'], y_pred_test)
+    # Split
+    real_test = min(test_size, int(len(df) * 0.2))
+    train = df.iloc[:-real_test]
+    test = df.iloc[-real_test:]
 
-    # 6. Entrenar modelo completo (Full Model)
-    full_model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
-    if regressor_cols:
-        for col in regressor_cols: # Añadir los mismos regresores al modelo final
-            full_model.add_regressor(col)
-    
-    full_model.fit(ts_data) # Entrenar con TODOS los datos
+    # Modelo Eval
+    m = Prophet()
+    for c in reg_cols:
+        m.add_regressor(c)
+    m.fit(train)
 
-    # 7. Crear DataFrame futuro
-    future = full_model.make_future_dataframe(periods=horizon, freq='MS')
-    
-    if regressor_cols:
-        future = pd.merge(future, regressors, on='ds', how='left')
-        future[regressor_cols] = future[regressor_cols].interpolate(method='linear', limit_direction='both')
+    future_test = test.drop(columns=["y"])
+    fc_test = m.predict(future_test)
+    metrics = evaluate_forecast(test["y"], fc_test["yhat"])
 
-    # 8. Generar pronóstico final
-    forecast = full_model.predict(future)
-    return full_model, forecast, metrics
-    
-@st.cache_data(show_spinner=False)
-def auto_arima_search(ts_data, test_size):
-    """Encuentra los parámetros óptimos para un modelo SARIMA usando auto_arima."""
-    ts_data_copy = ts_data.copy()
-    if not pd.api.types.is_datetime64_any_dtype(ts_data_copy.index):
-        ts_data_copy = ts_data_copy.set_index(Config.DATE_COL).sort_index()
+    # Modelo Final
+    m_full = Prophet()
+    for c in reg_cols:
+        m_full.add_regressor(c)
+    m_full.fit(df)
 
-    ts = ts_data_copy[Config.PRECIPITATION_COL].asfreq('MS').interpolate(method='time').dropna()
-    train = ts[:-test_size]
+    future = m_full.make_future_dataframe(periods=horizon, freq="MS")
+    # Pegar regresores futuros
+    if reg_cols:
+        future = pd.merge(future, r, on="ds", how="left")
+        for c in reg_cols:
+            future[c] = future[c].interpolate(method="linear").bfill().ffill()
+        future = (
+            future.dropna()
+        )  # Si no hay futuro en regresores, cortamos el pronóstico
 
-    auto_model = pm.auto_arima(train,
-                               start_p=1, start_q=1,
-                               test='adf',
-                               max_p=3, max_q=3,
-                               m=12,
-                               start_P=0, seasonal=True,
-                               d=None, D=None,
-                               trace=False,
-                               error_action='ignore',
-                               suppress_warnings=True,
-                               stepwise=True)
-    return auto_model.order, auto_model.seasonal_order
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    forecast = m_full.predict(future)
+    return m_full, forecast, metrics

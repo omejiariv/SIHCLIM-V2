@@ -1,709 +1,261 @@
 # app.py
 
-import streamlit as st
-import geopandas as gpd
-import pandas as pd
-import numpy as np
-import warnings
 import os
-from datetime import datetime
-import requests_cache
-import time
+import sys
+import streamlit as st
+import plotly.express as px
+import pandas as pd
 
-# --- Importaciones de Módulos Propios ---
-from modules.config import Config
-from modules.data_processor import load_and_process_all_data, complete_series
-from modules.visualizer import (
-    display_welcome_tab, 
-    display_alerts_tab,
-    display_spatial_distribution_tab, 
-    display_graphs_tab,
-    display_advanced_maps_tab, 
-    display_anomalies_tab, 
-    display_drought_analysis_tab,
-    display_stats_tab, 
-    display_correlation_tab, 
-    display_enso_tab,
-    
-    # --- ESTAS SON LAS IMPORTANTES ---
-    display_climate_forecast_tab,    # <--- ¡NUEVA FUNCIÓN!
-    display_trends_and_forecast_tab, # <--- ¡LA FUNCIÓN ORIGINAL!
-    # ---
-    
-    display_weekly_forecast_tab,
-    display_additional_climate_maps_tab, 
-    display_satellite_imagery_tab,
-    display_land_cover_analysis_tab,
-    display_life_zones_tab,
-    display_climate_scenarios_tab,
-    display_station_table_tab
+# --- 1. CONFIGURACIÓN DE PÁGINA (SIEMPRE DEBE IR PRIMERO) ---
+st.set_page_config(
+    page_title="SIHCLI-POTER | Centro de Comando",
+    page_icon="💧",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# [CORRECCIÓN PENDIENTE] Asegúrate de que 'modules/sidebar.py' contenga una función 'def create_sidebar(...):'
-# Si el error 'ImportError' persiste, es porque el archivo sidebar.py no tiene esa función.
-from modules.sidebar import create_sidebar
-from modules.reporter import generate_pdf_report
-from modules.analysis import calculate_monthly_anomalies, calculate_basin_stats
-from modules.github_loader import load_csv_from_url, load_zip_from_url
-from modules.data_processor import load_parquet_from_url
-
-# --- INICIO BLOQUE INICIALIZACIÓN DEM ---
-
-# Define el nombre del archivo DEM aquí o impórtalo desde Config si lo prefieres
-DEM_FILENAME = "DemAntioquia_EPSG3116.tif" 
-
-# Calcula la ruta absoluta una sola vez
+# --- 📂 IMPORTACIÓN ROBUSTA DE MÓDULOS ---
 try:
-    # Obtener la ruta del directorio actual del script app.py
-    _APP_DIR = os.path.dirname(__file__) 
-    # Construir la ruta a la carpeta 'data'
-    _DATA_DIR = os.path.abspath(os.path.join(_APP_DIR, 'data'))
-    # Construir la ruta completa al DEM
-    _DEM_PATH_APP = os.path.join(_DATA_DIR, DEM_FILENAME)
-except NameError:
-     # Fallback si __file__ no está definido (puede pasar en algunos entornos de ejecución)
-     _DEM_PATH_APP = os.path.join('data', DEM_FILENAME) 
+    from modules import selectors
+    from modules.utils import inicializar_torrente_sanguineo
+except ImportError:
+    # Fallback de rutas
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from modules import selectors
+    from modules.utils import inicializar_torrente_sanguineo
 
-# --- Desactivar Advertencias ---
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
+# ==========================================
+# 📂 MENÚ DE NAVEGACIÓN PERSONALIZADO
+# ==========================================
+# Llama al menú expandible para mantener coherencia en todo el sistema
+selectors.renderizar_menu_navegacion("Inicio")
 
-def apply_filters_to_stations(df, min_perc, altitudes, regions, municipios, celdas):
-    """Aplica una serie de filtros al DataFrame de estaciones."""
-    stations_filtered = df.copy()
-    if Config.PERCENTAGE_COL in stations_filtered.columns:
-        stations_filtered[Config.PERCENTAGE_COL] = pd.to_numeric(
-            stations_filtered[Config.PERCENTAGE_COL].astype(str).str.replace(',', '.', regex=False),
-            errors='coerce'
-        ).fillna(0)
-    if min_perc > 0:
-        stations_filtered = stations_filtered[stations_filtered[Config.PERCENTAGE_COL] >= min_perc]
-    if altitudes:
-        conditions = []
-        altitude_col_numeric = pd.to_numeric(stations_filtered[Config.ALTITUDE_COL], errors='coerce')
-        for r in altitudes:
-            if r == '0-500': conditions.append((altitude_col_numeric >= 0) & (altitude_col_numeric <= 500))
-            elif r == '500-1000': conditions.append((altitude_col_numeric > 500) & (altitude_col_numeric <= 1000))
-            elif r == '1000-2000': conditions.append((altitude_col_numeric > 1000) & (altitude_col_numeric <= 2000))
-            elif r == '2000-3000': conditions.append((altitude_col_numeric > 2000) & (altitude_col_numeric <= 3000))
-            elif r == '>3000': conditions.append(altitude_col_numeric > 3000)
-        if conditions:
-            stations_filtered = stations_filtered[pd.concat(conditions, axis=1).any(axis=1)]
-    if regions:
-        stations_filtered = stations_filtered[stations_filtered[Config.REGION_COL].isin(regions)]
-    if municipios:
-        stations_filtered = stations_filtered[stations_filtered[Config.MUNICIPALITY_COL].isin(municipios)]
-    if celdas and Config.CELL_COL in stations_filtered.columns:
-        stations_filtered = stations_filtered[stations_filtered[Config.CELL_COL].isin(celdas)]
-    return stations_filtered
+# ==============================================================================
+# 💉 INYECTAR TORRENTE SANGUÍNEO AL INICIO (Sistema Inmunológico)
+# ==============================================================================
+try:
+    inicializar_torrente_sanguineo()
+except Exception as e:
+    pass # Fallback silencioso para no romper la UI en caso de error de importación
 
-
-def main():
-    #--- Inicio de la Ejecución de la App ---
-    Config.initialize_session_state()
-    st.set_page_config(layout="wide", page_title=Config.APP_TITLE)
-    
-    # --- INICIO BLOQUE MODIFICADO ---
-    # Validación segura del DEM
-    try:
-        # Priorizar DEM en session_state (que pudo ser subido por el usuario en sidebar.py).
-        # Si ya está validado (por el sidebar), no hacer nada.
-        if not st.session_state.get('dem_file_path_validated', False):
-            # Si no hay DEM validado en la sesión, BUSCAR EL DEM BASE
-            if os.path.exists(_DEM_PATH_APP):
-                try:
-                    import rasterio
-                    with rasterio.open(_DEM_PATH_APP) as src:
-                        if src.crs:
-                            st.session_state['dem_crs_is_geographic'] = bool(src.crs.is_geographic)
-                        st.session_state['dem_file_path'] = _DEM_PATH_APP
-                        st.session_state['dem_file_path_validated'] = True
-                        st.session_state['dem_source_name'] = os.path.basename(_DEM_PATH_APP) # Guardar nombre base
-                        st.info(f"DEM base encontrado: {st.session_state['dem_source_name']}")
-                except Exception as e_dem:
-                    st.warning(f"No se pudo validar DEM base {_DEM_PATH_APP}: {e_dem}")
-                    st.session_state['dem_file_path_validated'] = False
-    except RuntimeError:
-        pass
-    # --- FIN BLOQUE MODIFICADO ---
+# ==============================================================================
+# 🔒 MURO DE SEGURIDAD GLOBAL (ACCESO BETA)
+# ==============================================================================
+def muro_de_acceso_beta():
+    if "beta_unlocked" not in st.session_state:
+        st.session_state["beta_unlocked"] = False
         
-    st.markdown("""<style>div.block-container{padding-top:1rem;} [data-testid="stMetricValue"] {font-size: 1.8rem;} [data-testid="stMetricLabel"] {font-size: 1rem; padding-bottom:5px; }</style>""", unsafe_allow_html=True)
-
-    #--- TÍTULO DE LA APP ---
-    title_col1, title_col2 = st.columns([0.05, 0.95])
-    with title_col1:
-        if os.path.exists(Config.LOGO_PATH):
-            st.image(Config.LOGO_PATH, width=60)
-    with title_col2:
-        st.markdown(f'<h1 style="font-size:28px; margin-top:1rem;">{Config.APP_TITLE}</h1>', unsafe_allow_html=True)
-
-    #--- DEFINICIÓN DE PESTAÑAS (CORREGIDA) ---
-    tab_names = [
-        "Bienvenida",                 # 0
-        "Alertas y Resumen",          # 1
-        "Distribución Espacial",      # 2
-        "Gráficos",                   # 3
-        "Mapas Avanzados",            # 4
-        "Variables Climáticas",       # 5
-        "Imágenes Satelitales",       # 6
-        "Análisis Cobertura Suelo",   # 7
-        "Zonas de Vida",              # 8
-        "Escenarios Climáticos",      # 9
-        "Análisis de Anomalías",      # 10
-        "Análisis de Extremos",       # 11
-        "Estadísticas",               # 12
-        "Correlación",                # 13
-        "Análisis ENSO",              # 14
-        "Pronóstico Climático",       # 15 (La nueva para ONI/SOI)
-        "Tendencias y Pronósticos",    # 16 (La original para Precipitación)
-        "Pronóstico Semanal",         # 17
-        "Análisis por Cuenca",        # 18
-        "Comparación de Periodos",    # 19
-        "Tabla de Estaciones",        # 20
-        "Generar Reporte"             # 21
-    ]
-    tabs = st.tabs(tab_names)
-    
-    #--- PANEL DE CARGA DE DATOS (LÓGICA CORREGIDA) ---
-    with st.sidebar.expander("**Subir/Actualizar Archivos Base**", expanded=not st.session_state.get('data_loaded', False)):
+    if not st.session_state["beta_unlocked"]:
+        st.title("🔒 Sihcli-Poter: Fase de Pruebas (Beta)")
+        st.info("Esta plataforma científica se encuentra en fase de acceso restringido. Por favor, ingresa la credencial proporcionada por el equipo de investigación.")
         
-        # Guardar el modo de carga en la sesión
-        st.radio("Modo de Carga", ("GitHub", "Manual"), key="load_mode", horizontal=True)
-        
-        if st.session_state.load_mode == "Manual":
-            # Guardar los objetos FileUploader en la sesión (son ligeros)
-            st.file_uploader("1. Archivo de estaciones (CSV)", type="csv", key="file_mapa")
-            st.file_uploader("2. Archivo de precipitación (CSV)", type="csv", key="file_precip")
-            st.file_uploader("3. Shapefile de municipios (.zip)", type="zip", key="file_shape")
-            # [CORRECCIÓN] Añadido el uploader para el Parquet que faltaba en tu app.py
-            st.file_uploader("4. Datos largos (Parquet)", type="parquet", key="file_parquet")
-
-            if st.button("Procesar Datos Manuales"):
-                if all([st.session_state.file_mapa, st.session_state.file_precip, st.session_state.file_shape, st.session_state.file_parquet]):
-                    # Solo activamos el 'flag' de que los datos están listos.
-                    # La carga real se hará después del st.stop()
-                    st.session_state.data_loaded = True
-                    st.rerun() # Forzamos un rerun para salir del expander y cargar datos
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            clave_beta = st.text_input("Credencial de Acceso:", type="password")
+            if st.button("Ingresar al Gemelo Digital", type="primary", use_container_width=True):
+                # 💡 La contraseña por defecto es "Aleph2026"
+                if clave_beta == st.secrets.get("CLAVE_BETA", "Aleph2026"):
+                    st.session_state["beta_unlocked"] = True
+                    st.rerun() # Recarga la página y muestra todo el contenido
                 else:
-                    st.warning("Por favor, suba los 4 archivos requeridos (Estaciones, Precipitación, Municipios y Parquet).")
-        else:
-            st.info(f"Datos desde: **{Config.GITHUB_USER}/{Config.GITHUB_REPO}**")
-            if st.button("Cargar Datos desde GitHub"):
-                # Solo activamos el 'flag'. La carga se hará después.
-                st.session_state.data_loaded = True
-                st.rerun() # Forzamos un rerun
-
-    #--- LÓGICA DE CONTROL DE FLUJO (CORREGIDA) ---
-    if not st.session_state.get('data_loaded', False):
-        with tabs[0]:
-            display_welcome_tab()
-        for i, tab in enumerate(tabs):
-            if i > 0:
-                with tab:
-                    st.warning("Para comenzar, cargue los datos usando el panel de la izquierda.")
-        st.stop() # Detiene la ejecución si no hay datos cargados
-
-    #--- CARGA DE DATOS DESDE CACHÉ (ESTA ES LA CORRECCIÓN CLAVE) ---
-    # Si 'data_loaded' es True, esta sección se ejecuta EN CADA RERUN.
-    # Pero como 'load_and_process_all_data' está cacheada (@st.cache_data),
-    # solo se ejecutará la primera vez. Las siguientes veces será instantáneo.
-    
-    gdf_stations, gdf_municipios, df_long, df_enso, gdf_subcuencas = None, None, None, None, None
-    
-    try:
-        if st.session_state.load_mode == "Manual":
-            # Verifica que los archivos sigan en la sesión
-            if all([st.session_state.file_mapa, st.session_state.file_precip, st.session_state.file_shape, st.session_state.file_parquet]):
-                with st.spinner("Cargando datos locales (desde caché si es posible)..."):
-                    gdf_stations, gdf_municipios, df_long, df_enso, gdf_subcuencas = \
-                        load_and_process_all_data(
-                            st.session_state.file_mapa, 
-                            st.session_state.file_precip, 
-                            st.session_state.file_shape,
-                            st.session_state.file_parquet
-                        )
-            else:
-                st.error("Se perdieron las referencias a los archivos. Por favor, recárguelos.")
-                st.session_state.data_loaded = False
-                st.stop()
+                    st.error("❌ Credencial incorrecta. Acceso denegado.")
         
-        else: # st.session_state.load_mode == "GitHub"
-            with st.spinner("Cargando datos de GitHub (desde caché si es posible)..."):
-                # Las funciones de carga de URL también están cacheadas
-                file_mapa_git = load_csv_from_url(Config.URL_ESTACIONES_CSV)
-                file_precip_git = load_csv_from_url(Config.URL_PRECIPITACION_CSV)
-                file_shape_git = load_zip_from_url(Config.URL_SHAPEFILE_ZIP)
-                file_parquet_git = load_parquet_from_url(Config.URL_PARQUET)
-                
-                # [CORRECCIÓN] Se comprueba explícitamente que ningún item sea 'None'
-                # en lugar de evaluar el "valor de verdad" (que falla en DataFrames).
-                if all(item is not None for item in [file_mapa_git, file_precip_git, file_shape_git, file_parquet_git]):
-                    # Llamamos a la función principal de procesamiento
-                    gdf_stations, gdf_municipios, df_long, df_enso, gdf_subcuencas = \
-                        load_and_process_all_data(
-                            file_mapa_git, 
-                            file_precip_git, 
-                            file_shape_git,
-                            file_parquet_git
-                        )
-                else:
-                    st.error("No se pudieron descargar los archivos de GitHub. Verifique la conexión o las URLs.")
-                    st.session_state.data_loaded = False
-                    st.stop()
-        
-        # Chequeo final de que los datos se cargaron en las variables locales
-        if df_long is None or gdf_stations is None or gdf_municipios is None or gdf_subcuencas is None:
-            st.error("La carga de datos falló. Verifique los archivos de origen.")
-            st.session_state.data_loaded = False
-            st.stop()
+        # 🛑 st.stop() es la magia: evita que Python siga leyendo el código hacia abajo
+        st.stop() 
 
-    except Exception as e:
-        st.error(f"Error fatal durante la carga de datos: {e}")
-        st.exception(e) # Muestra el traceback completo para depuración
-        st.session_state.data_loaded = False
-        st.stop()
+# Llamamos a la función para activar el escudo
+muro_de_acceso_beta()
+# ==============================================================================
 
-    # --- INICIO DE BLOQUE AÑADIDO ---
-    # Guardar las variables locales clave en session_state
-    # para que las pestañas heredadas (Análisis por Cuenca, etc.) puedan encontrarlas.
-    st.session_state.gdf_stations = gdf_stations
-    st.session_state.df_long = df_long
-    st.session_state.df_enso = df_enso
-    st.session_state.gdf_municipios = gdf_municipios
-    st.session_state.gdf_subcuencas = gdf_subcuencas
-    # --- FIN DE BLOQUE AÑADIDO ---
-
-    #--- SECCIÓN DE CONTROL DEL SIDEBAR (DATOS YA CARGADOS) ---
-    st.sidebar.success("Datos cargados.")
-    if st.sidebar.button("Limpiar Caché y Reiniciar"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        requests_cache.clear()
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
-
-    # [CORRECCIÓN] Llamada a create_sidebar ahora usa las variables locales,
-    # NO las de st.session_state
-    sidebar_filters = create_sidebar(gdf_stations, df_long)
-    
-    # Extraemos los valores del diccionario retornado
-    gdf_filtered = sidebar_filters["gdf_filtered"]
-    stations_for_analysis = sidebar_filters["selected_stations"]
-    year_range = sidebar_filters["year_range"]
-    meses_numeros = sidebar_filters["meses_numeros"]
-    analysis_mode = sidebar_filters["analysis_mode"] 
-    exclude_na = sidebar_filters["exclude_na"]
-    exclude_zeros = sidebar_filters["exclude_zeros"]
-    
-    # Detener si no hay estaciones seleccionadas después de filtrar
-    if not stations_for_analysis:
-        with tabs[0]:
-            display_welcome_tab()
-        for i, tab in enumerate(tabs):
-             if i > 0:
-                 with tab:
-                     st.info("Para comenzar, seleccione al menos una estación en el panel de la izquierda.")
-        st.stop()
-
-    #--- Procesamiento de Datos Post-Filtros (Lógica Optimizada) ---
-
-    # 1. Ejecutar complete_series SOLO UNA VEZ si es necesario
-    if analysis_mode == "Completar series (interpolación)":
-        if 'df_completed' not in st.session_state:
-            with st.spinner("Procesando y cacheando series completadas por primera vez..."):
-                # [CORRECCIÓN] Llama a complete_series con la variable local df_long
-                st.session_state.df_completed = complete_series(df_long)
-                if st.session_state.df_completed.empty:
-                    st.warning("La completación de series no produjo resultados.")
-                    st.session_state.df_completed = df_long # Fallback
-        base_df_monthly = st.session_state.df_completed
-    else:
-        # [CORRECCIÓN] Usa la variable local df_long
-        base_df_monthly = df_long
-        if Config.ORIGIN_COL not in base_df_monthly.columns:
-            base_df_monthly[Config.ORIGIN_COL] = 'Original'
-
-    # 2. Aplicar TODOS los filtros (Estación, Fecha, Mes)
-    if not base_df_monthly.empty:
-        df_monthly_filtered = base_df_monthly[
-            (base_df_monthly[Config.STATION_NAME_COL].isin(stations_for_analysis)) &
-            (base_df_monthly[Config.DATE_COL].dt.year >= year_range[0]) &
-            (base_df_monthly[Config.DATE_COL].dt.year <= year_range[1]) &
-            (base_df_monthly[Config.DATE_COL].dt.month.isin(meses_numeros))
-        ].copy()
-    else:
-        df_monthly_filtered = pd.DataFrame() 
-
-    # 3. Aplicar exclusión de NaN y Ceros
-    if not df_monthly_filtered.empty:
-        if exclude_na:
-            df_monthly_filtered.dropna(subset=[Config.PRECIPITATION_COL], inplace=True)
-        if exclude_zeros:
-            df_monthly_filtered[Config.PRECIPITATION_COL] = pd.to_numeric(df_monthly_filtered[Config.PRECIPITATION_COL], errors='coerce')
-            df_monthly_filtered = df_monthly_filtered.dropna(subset=[Config.PRECIPITATION_COL]) 
-            df_monthly_filtered = df_monthly_filtered[df_monthly_filtered[Config.PRECIPITATION_COL] > 0]
-    
-    # 4. Calcular datos anuales
-    df_anual_melted = pd.DataFrame() 
-    if not df_monthly_filtered.empty and Config.PRECIPITATION_COL in df_monthly_filtered.columns and Config.MONTH_COL in df_monthly_filtered.columns:
-        try:
-            annual_agg = df_monthly_filtered.groupby([Config.STATION_NAME_COL, Config.YEAR_COL]).agg(
-                precipitation_sum=(Config.PRECIPITATION_COL, lambda x: pd.to_numeric(x, errors='coerce').sum()), 
-                meses_validos=(Config.MONTH_COL, 'nunique') 
-            ).reset_index()
-            annual_agg.loc[annual_agg['meses_validos'] < 10, 'precipitation_sum'] = np.nan 
-            df_anual_melted = annual_agg.rename(columns={'precipitation_sum': Config.PRECIPITATION_COL})
-            df_anual_melted = df_anual_melted[[Config.STATION_NAME_COL, Config.YEAR_COL, Config.PRECIPITATION_COL, 'meses_validos']]
-        except Exception as e_agg:
-            st.error(f"Error durante la agregación anual: {e_agg}")
-            df_anual_melted = pd.DataFrame()
-    elif not df_monthly_filtered.empty:
-         st.warning("Columnas necesarias ('precipitation', 'month') no encontradas en df_monthly_filtered para agregación anual.")
-
-    # --- FIN LÓGICA REVISADA ---
-    
-    # [CORRECCIÓN] Preparar argumentos para las pestañas, usando variables locales
-    display_args = {
-        # --- Datos base cargados (locales) ---
-        "gdf_stations": gdf_stations,
-        "gdf_municipios": gdf_municipios,
-        "df_long": df_long,
-        "df_enso": df_enso,
-        "gdf_subcuencas": gdf_subcuencas,
-        
-        # --- Resultados de filtros (locales) ---
-        "gdf_filtered": gdf_filtered,
-        "stations_for_analysis": stations_for_analysis,
-        "df_anual_melted": df_anual_melted,
-        "df_monthly_filtered": df_monthly_filtered,
-        "analysis_mode": analysis_mode, 
-        
-        # --- Opciones de filtro (del sidebar) ---
-        "selected_regions": sidebar_filters["selected_regions"],
-        "selected_municipios": sidebar_filters["selected_municipios"],
-        "selected_altitudes": sidebar_filters["selected_altitudes"]
+# --- ESTILOS CSS PERSONALIZADOS (MEJORADOS) ---
+st.markdown("""
+    <style>
+    .metric-card {
+        background-color: #ffffff;
+        border-radius: 10px;
+        padding: 15px;
+        border-left: 5px solid #3498db;
+        border-top: 1px solid #e0e6ed;
+        border-right: 1px solid #e0e6ed;
+        border-bottom: 1px solid #e0e6ed;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.04);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
-    
-    #--- Renderizado de Pestañas (CORREGIDO Y COMPLETO) ---
-    
-    with tabs[0]:  # Bienvenida
-        display_welcome_tab()
-    
-    with tabs[1]:  # Alertas y Resumen
-        display_alerts_tab(**display_args)
-    
-    with tabs[2]:  # Distribución Espacial
-        display_spatial_distribution_tab(**display_args)
-    
-    with tabs[3]:  # Gráficos
-        display_graphs_tab(**display_args)
-    
-    with tabs[4]:  # Mapas Avanzados
-        display_advanced_maps_tab(**display_args)
-    
-    with tabs[5]:  # Variables Climáticas
-        display_additional_climate_maps_tab(**display_args)
-    
-    with tabs[6]:  # Imágenes Satelitales
-        display_satellite_imagery_tab(**display_args)
-    
-    with tabs[7]:  # Análisis Cobertura Suelo
-        display_land_cover_analysis_tab(**display_args)
-    
-    with tabs[8]:  # Zonas de Vida
-        display_life_zones_tab(**display_args)
-        
-    with tabs[9]:  # Escenarios Climáticos
-        display_climate_scenarios_tab(**display_args)
-    
-    with tabs[10]: # Análisis de Anomalías
-        display_anomalies_tab(**display_args)
-    
-    with tabs[11]: # Análisis de Extremos
-        display_drought_analysis_tab(**display_args)
-    
-    with tabs[12]: # Estadísticas
-        display_stats_tab(**display_args)
-    
-    with tabs[13]: # Correlación
-        display_correlation_tab(**display_args)
-    
-    with tabs[14]: # Análisis ENSO
-        display_enso_tab(**display_args)
-    
-    # --- PESTAÑAS DE PRONÓSTICO CORREGIDAS ---
-    
-    with tabs[15]: # Pronóstico Climático (NUEVA FUNCIÓN)
-        # Pasa df_enso y df_long (original) que están dentro de display_args
-        display_climate_forecast_tab(**display_args)
-        
-    with tabs[16]: # Tendencias y Pronósticos (FUNCIÓN ORIGINAL)
-        # Pasa el df_long original como df_full_monthly
-        display_trends_and_forecast_tab(df_full_monthly=df_long, **display_args)
-        
-    with tabs[17]: # Pronóstico Semanal
-        display_weekly_forecast_tab(
-            stations_for_analysis=stations_for_analysis,
-            gdf_filtered=gdf_filtered
-        )
-    
-# --- PESTAÑAS DE ANÁLISIS RESTANTES ---
+    .metric-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 8px 12px rgba(0,0,0,0.1);
+    }
+    .main-header {
+        font-size: 2.8rem;
+        font-weight: 800;
+        color: #0f172a;
+        margin-bottom: 0px;
+        letter-spacing: -0.02em;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        color: #64748b;
+        margin-bottom: 25px;
+        font-weight: 500;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-    with tabs[18]: # Análisis por Cuenca
-        st.header("Análisis Agregado por Cuenca Hidrográfica")
-        if 'gdf_subcuencas' in st.session_state and st.session_state.gdf_subcuencas is not None and not st.session_state.gdf_subcuencas.empty:
-            BASIN_NAME_COLUMN = 'SUBC_LBL'
-            if BASIN_NAME_COLUMN in st.session_state.gdf_subcuencas.columns:
-                basin_names = []
-                regions_from_sidebar = sidebar_filters.get("selected_regions", [])
-                basins_in_selected_regions = st.session_state.gdf_subcuencas.copy()
+# --- 2. ENCABEZADO Y KPIS ---
+st.markdown('<p class="main-header">🌊 SIHCLI-POTER</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Sistema de Información Hidroclimática Integrada | Gemelo Digital Territorial</p>', unsafe_allow_html=True)
 
-                if regions_from_sidebar:
-                    if Config.REGION_COL in basins_in_selected_regions.columns:
-                         basins_in_selected_regions = basins_in_selected_regions[
-                             basins_in_selected_regions[Config.REGION_COL].isin(regions_from_sidebar)
-                         ]
-                         if basins_in_selected_regions.empty:
-                             st.info("Ninguna subcuenca encontrada en las regiones seleccionadas.")
-                    else:
-                         st.warning(f"El archivo de subcuencas no tiene la columna '{Config.REGION_COL}'. No se puede filtrar por región.")
+# Panel de Métricas Globales (Dashboard)
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Módulos Analíticos", "14 Especializados", "Operativos") # Ajustado a 14 por la fusión
+col2.metric("Resolución Temporal", "1950 - 2070", "Datos Históricos + Proyecciones")
+col3.metric("Cobertura Geográfica", "Región Andina", "Topología de Cuencas")
+col4.metric("Motores de Decisión", "WRI / AHP / Turc", "Estándares Globales")
+
+st.divider()
+
+# --- 3. PESTAÑAS PRINCIPALES ---
+tab_dashboard, tab_arquitectura, tab_aleph = st.tabs([
+    "🎛️ Centro de Comando (Módulos)", 
+    "🏗️ Arquitectura del Sistema", 
+    "📖 Filosofía (El Aleph)"
+])
+
+# =====================================================================
+# PESTAÑA 1: CENTRO DE COMANDO (GRID DE NAVEGACIÓN)
+# =====================================================================
+with tab_dashboard:
+    # --- EJE 1 ---
+    st.markdown("### 🌍 EJE 1: Soporte Biofísico (Condiciones Base)")
+    st.caption("Módulos dedicados a la lectura y modelación del entorno natural, el clima y el subsuelo.")
+    
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.page_link("pages/01_🌦️_Clima_e_Hidrologia.py", label="**Clima e Hidrología**", icon="🌦️")
+        st.markdown("<small>Tablero de control telemétrico, análisis de variabilidad y pronósticos ENSO (IRI).</small>", unsafe_allow_html=True)
+    with c2:
+        st.page_link("pages/02_💧_Aguas_Subterraneas.py", label="**Aguas Subterráneas**", icon="💧")
+        st.markdown("<small>Modelación de recarga potencial de acuíferos mediante balance hídrico (Turc).</small>", unsafe_allow_html=True)
+    with c3:
+        st.page_link("pages/03_🗺️_Isoyetas_HD.py", label="**Isoyetas HD y Espacialización**", icon="🗺️")
+        st.markdown("<small>Generador climático: Interpolación espacial (RBF) de lluvia y escenarios predictivos.</small>", unsafe_allow_html=True)
+        
+    c4, c5, _ = st.columns(3)
+    with c4:
+        st.page_link("pages/04_🍃_Biodiversidad.py", label="**Biodiversidad**", icon="🍃")
+        st.markdown("<small>Monitor de especies (GBIF), endemismos y valoración económica de servicios ecosistémicos.</small>", unsafe_allow_html=True)
+    with c5:
+        st.page_link("pages/05_🏔️_Geomorfologia.py", label="**Geomorfología**", icon="🏔️")
+        st.markdown("<small>Análisis de Modelos Digitales de Elevación (DEM), redes de drenaje y morfometría.</small>", unsafe_allow_html=True)
+
+    st.markdown("<hr style='margin: 10px 0; border-top: 1px dashed #ccc;'>", unsafe_allow_html=True)
+    
+    # --- EJE 2 ---
+    st.markdown("### ⚙️ EJE 2: Metabolismo Territorial (Presiones Antrópicas)")
+    st.caption("Módulos enfocados en la dinámica poblacional y el impacto sobre la red hídrica.")
+    
+    c6, c7 = st.columns(2)
+    with c6:
+        st.page_link("pages/06_📈_Modelo_Demografico.py", label="**Modelo Demográfico (Humanos)**", icon="📈")
+        st.markdown("<small>Proyecciones poblacionales (DANE) multimodelo con inyección a la Memoria Global.</small>", unsafe_allow_html=True)
+        st.write("") # Espaciador
+        
+        st.page_link("pages/06_🐄_Modelo_Pecuario.py", label="**Modelo Pecuario (Animales)**", icon="🐄")
+        st.markdown("<small>Proyecciones de crecimiento (ICA) para Bovinos, Porcinos y Aves en escalas hidrográficas.</small>", unsafe_allow_html=True)
+        
+    with c7:
+        st.page_link("pages/07_💧_Calidad_y_Vertimientos.py", label="**Calidad y Vertimientos**", icon="🧪")
+        st.markdown("<small>Mapeo de usuarios del recurso, modelación de concesiones y cargas contaminantes DBO.</small>", unsafe_allow_html=True)
+        st.write("") # Espaciador
+        st.page_link("pages/08_🔗_Sistemas_Hidricos_Territoriales.py", label="**Sistemas Hídricos Territoriales**", icon="🔗")
+        st.markdown("<small>Topología de redes, diagramas de Sankey y huella hídrica consolidada en la nube.</small>", unsafe_allow_html=True)
+
+    st.markdown("<hr style='margin: 10px 0; border-top: 1px dashed #ccc;'>", unsafe_allow_html=True)
+
+    # --- EJE 3 ---
+    st.markdown("### 🧠 EJE 3: Síntesis y Estrategia (DSS)")
+    st.caption("Sistemas de Soporte de Decisiones para planeación, ordenamiento y priorización de inversiones.")
+    
+    c9, c10, _ = st.columns(3)
+    with c9:
+        st.page_link("pages/09_📊_Toma_de_Decisiones.py", label="**Toma de Decisiones**", icon="📊")
+        st.markdown("<small>Dashboard Maestro: Estrés hídrico, Portafolio WRI y análisis multicriterio (AHP).</small>", unsafe_allow_html=True)
+    with c10:
+        st.page_link("pages/10_👑_Panel_Administracion.py", label="**Panel de Administración**", icon="👑")
+        st.markdown("<small>Aduana SIG, carga de datos maestros a la nube (Supabase) y gestión del sistema.</small>", unsafe_allow_html=True)
+
+    st.markdown("<hr style='margin: 10px 0; border-top: 1px dashed #ccc;'>", unsafe_allow_html=True)
+
+    # --- EJE 4 ---
+    st.markdown("### 🛠️ EJE 4: Soporte Técnico y Herramientas")
+    st.caption("Utilidades del sistema para mantenimiento, documentación y depuración del gemelo digital.")
+    
+    # Ajustado a 3 columnas por la unificación
+    c11, c12, c13 = st.columns(3)
+    with c11:
+        st.page_link("pages/11_⚙️_Generador.py", label="**Generador**", icon="⚙️")
+        st.markdown("<small>Motor de geoprocesamiento.</small>", unsafe_allow_html=True)
+    with c12:
+        st.page_link("pages/12_📚_Ayuda_y_Docs.py", label="**Ayuda y Docs**", icon="📚")
+        st.markdown("<small>Manuales y documentación técnica.</small>", unsafe_allow_html=True)
+    with c13:
+        st.page_link("pages/13_🕵️_Detective.py", label="**Detective Espacial**", icon="🕵️")
+        st.markdown("<small>Auditoría BD y diagnóstico de proyecciones (CRS).</small>", unsafe_allow_html=True)
+
+
+# =====================================================================
+# PESTAÑA 2: ARQUITECTURA DEL SISTEMA (SUNBURST)
+# =====================================================================
+with tab_arquitectura:
+    st.markdown("### Mapa Topológico del Sistema")
+    st.info("Visualización jerárquica de la arquitectura de la plataforma y sus submódulos lógicos.")
+    
+    # Matriz actualizada: Se retira "Diagnóstico" y se consolida todo en 14 módulos (sin contar Inicio)
+    ids = ['SIHCLI-POTER', 'Soporte Biofísico', 'Metabolismo Territorial', 'Síntesis Estratégica', 'Herramientas', 
+           'Clima e Hidrología', 'Aguas Subterráneas', 'Isoyetas HD', 'Biodiversidad', 'Geomorfología',
+           'Modelo Demográfico', 'Modelo Pecuario', 'Calidad y Vertimientos', 'Sistemas Hídricos', 
+           'Toma de Decisiones', 'Panel Administración',
+           'Generador', 'Ayuda y Docs', 'Detective']
+            
+    parents = ['', 'SIHCLI-POTER', 'SIHCLI-POTER', 'SIHCLI-POTER', 'SIHCLI-POTER',
+               'Soporte Biofísico', 'Soporte Biofísico', 'Soporte Biofísico', 'Soporte Biofísico', 'Soporte Biofísico',
+               'Metabolismo Territorial', 'Metabolismo Territorial', 'Metabolismo Territorial', 'Metabolismo Territorial',
+               'Síntesis Estratégica', 'Síntesis Estratégica',
+               'Herramientas', 'Herramientas', 'Herramientas']
                 
-                if not basins_in_selected_regions.empty and 'gdf_filtered' in sidebar_filters and not sidebar_filters['gdf_filtered'].empty:
-                     if basins_in_selected_regions.crs is None: basins_in_selected_regions.set_crs(st.session_state.gdf_stations.crs, allow_override=True)
-                     if sidebar_filters['gdf_filtered'].crs is None: sidebar_filters['gdf_filtered'].set_crs(st.session_state.gdf_stations.crs, allow_override=True)
-                     target_crs_sjoin = "EPSG:4326"
-                     try:
-                          basins_for_sjoin = basins_in_selected_regions.to_crs(target_crs_sjoin)
-                          stations_for_sjoin = sidebar_filters['gdf_filtered'].to_crs(target_crs_sjoin)
-                          relevant_basins_gdf = gpd.sjoin(
-                              basins_for_sjoin, stations_for_sjoin,
-                              how="inner", predicate="intersects"
-                          )
-                          if not relevant_basins_gdf.empty:
-                              basin_names = sorted(relevant_basins_gdf[BASIN_NAME_COLUMN].dropna().unique())
-                     except Exception as e_sjoin:
-                          st.error(f"Error durante la unión espacial (sjoin): {e_sjoin}")
-                          basin_names = []
-                
-                if not basin_names:
-                    st.info("Ninguna cuenca (en las regiones/filtros seleccionados) contiene estaciones que coincidan con todos los filtros actuales.")
-                else:
-                     selected_basin = st.selectbox(
-                        "Seleccione una cuenca para analizar:",
-                        options=basin_names,
-                        key="basin_selector" 
-                     )
-                     if selected_basin:
-                        stats_df, stations_in_selected_basin, error_msg = calculate_basin_stats(
-                            sidebar_filters['gdf_filtered'],
-                            st.session_state.gdf_subcuencas,
-                            df_monthly_filtered,
-                            selected_basin,
-                            BASIN_NAME_COLUMN
-                        )
+    values = [100, 35, 35, 20, 10, 
+              7, 7, 7, 7, 7, 
+              8.75, 8.75, 8.75, 8.75, 
+              10, 10, 
+              3.3, 3.3, 3.4]
 
-                        if error_msg: st.warning(error_msg)
-                        if stations_in_selected_basin:
-                            st.subheader(f"Resultados para la cuenca: {selected_basin}")
-                            st.metric("Número de Estaciones Filtradas en la Cuenca", len(stations_in_selected_basin))
-                            with st.expander("Ver estaciones incluidas"):
-                                st.write(", ".join(stations_in_selected_basin))
-                            if stats_df is not None and not stats_df.empty:
-                                st.markdown("---")
-                                st.write("**Estadísticas de Precipitación Mensual (Agregada para estaciones filtradas en la cuenca)**")
-                                st.dataframe(stats_df, use_container_width=True)
-                            else:
-                                st.info("Aunque se encontraron estaciones filtradas en la cuenca, no hay datos de precipitación válidos para el período/meses seleccionados.")
-            else:
-                st.error(f"Error Crítico: No se encontró la columna de nombres '{BASIN_NAME_COLUMN}' en el archivo de subcuencas.")
-        else:
-           st.warning("Los datos de las subcuencas no están cargados o el archivo está vacío.")
+    if len(ids) == len(parents) == len(values):
+        df = pd.DataFrame(dict(ids=ids, parents=parents, values=values))
+        fig = px.sunburst(df, names='ids', parents='parents', values='values', color='parents', color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig.update_layout(margin=dict(t=20, l=0, r=0, b=0), height=600, paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+
+# =====================================================================
+# PESTAÑA 3: EL ALEPH (FILOSOFÍA)
+# =====================================================================
+with tab_aleph:
+    st.markdown("### La Visión Detrás de SIHCLI-POTER")
+    c_aleph1, c_aleph2 = st.columns([1, 1])
     
-    with tabs[19]: # Comparación de Periodos
-        st.header("Comparación de Periodos de Tiempo")
-        analysis_level = st.radio(
-            "Seleccione el nivel de análisis para la comparación:",
-            ("Promedio Regional (Todas las estaciones seleccionadas)", "Por Cuenca Específica"),
-            key="compare_level_radio"
-        )
-        df_to_compare = pd.DataFrame()
-
-        if analysis_level == "Por Cuenca Específica":
-            st.markdown("---")
-            if st.session_state.gdf_subcuencas is not None and not st.session_state.gdf_subcuencas.empty:
-                BASIN_NAME_COLUMN = 'SUBC_LBL'
-                if BASIN_NAME_COLUMN in st.session_state.gdf_subcuencas.columns:
-                    relevant_basins_gdf = gpd.sjoin(st.session_state.gdf_subcuencas, gdf_filtered, how="inner", predicate="intersects")
-                    if not relevant_basins_gdf.empty:
-                        basin_names = sorted(relevant_basins_gdf[BASIN_NAME_COLUMN].dropna().unique())
-                    else:
-                         basin_names = []
-                    if not basin_names:
-                        st.warning("Ninguna cuenca contiene estaciones que coincidan con los filtros actuales.", icon="⚠️")
-                    else:
-                         selected_basin = st.selectbox(
-                            "Seleccione la cuenca a comparar:",
-                            options=basin_names,
-                            key="compare_basin_selector"
-                        )
-                         target_basin_geom = st.session_state.gdf_subcuencas[st.session_state.gdf_subcuencas[BASIN_NAME_COLUMN] == selected_basin]
-                         stations_in_basin = gpd.sjoin(gdf_filtered, target_basin_geom, how="inner", predicate="within")
-                         station_names_in_basin = stations_in_basin[Config.STATION_NAME_COL].unique().tolist()
-                         df_to_compare = df_monthly_filtered[df_monthly_filtered[Config.STATION_NAME_COL].isin(station_names_in_basin)]
-                         st.info(f"Análisis para **{len(station_names_in_basin)}** estaciones encontradas en la cuenca **{selected_basin}**.", icon="ℹ️")
-                else:
-                     st.error(f"Error Crítico: No se encontró la columna de nombres '{BASIN_NAME_COLUMN}' en el archivo de subcuencas.")
-            else:
-                st.warning("Los datos de las subcuencas no están cargados.", icon="⚠️")
-        else: # Promedio Regional
-            df_to_compare = df_monthly_filtered
+    with c_aleph1:
+        st.markdown("""
+        **La Complejidad de los Andes**
+        La región Andina presenta uno de los sistemas climáticos más complejos del mundo. Viajar hacia arriba es como viajar hacia los polos. Esta verticalidad y la interacción con dos océanos crean un mosaico de biodiversidad y clima, sometido al constante latido del ENSO (El Niño / La Niña).
         
-        st.markdown("---")
-        if df_to_compare.empty:
-            st.warning("Seleccione una opción con estaciones válidas para poder realizar la comparación.", icon="ℹ️")
-        else:
-            years_with_data = sorted(df_to_compare[Config.YEAR_COL].dropna().unique())
-            min_year, max_year = int(years_with_data[0]), int(years_with_data[-1])
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("#### Periodo 1")
-                periodo1 = st.slider(
-                    "Seleccione el rango de años para el Periodo 1",
-                    min_year, max_year,
-                    (min_year, min_year + 10 if min_year + 10 < max_year else max_year),
-                    key="periodo1_slider_comp"
-                )
-            with col2:
-                st.markdown("#### Periodo 2")
-                periodo2 = st.slider(
-                    "Seleccione el rango de años para el Periodo 2",
-                    min_year, max_year,
-                    (max_year - 10 if max_year - 10 > min_year else min_year, max_year),
-                    key="periodo2_slider_comp"
-                )
-            df_periodo1 = df_to_compare[(df_to_compare[Config.DATE_COL].dt.year >= periodo1[0]) & (df_to_compare[Config.DATE_COL].dt.year <= periodo1[1])]
-            df_periodo2 = df_to_compare[(df_to_compare[Config.DATE_COL].dt.year >= periodo2[0]) & (df_to_compare[Config.DATE_COL].dt.year <= periodo2[1])]
-            st.markdown("---")
-            st.subheader("Resultados Comparativos")
-            if df_periodo1.empty or df_periodo2.empty:
-                st.warning("Uno o ambos periodos seleccionados no contienen datos. Por favor, ajuste los rangos.")
-            else:
-                stats1_mean = df_periodo1[Config.PRECIPITATION_COL].mean()
-                stats2_mean = df_periodo2[Config.PRECIPITATION_COL].mean()
-                delta = ((stats2_mean - stats1_mean) / stats1_mean) * 100 if stats1_mean != 0 else 0
-                st.metric(
-                    label=f"Precipitación Media Mensual ({periodo1[0]}-{periodo1[1]} vs. {periodo2[0]}-{periodo2[1]})",
-                    value=f"{stats2_mean:.1f} mm",
-                    delta=f"{delta:.2f}% (respecto a {stats1_mean:.1f} mm del Periodo 1)"
-                )
-                st.markdown("##### Desglose Estadístico Completo")
-                col1_stats, col2_stats = st.columns(2)
-                with col1_stats:
-                    st.write(f"**Periodo 1 ({periodo1[0]}-{periodo1[1]})**")
-                    st.dataframe(df_periodo1[Config.PRECIPITATION_COL].describe().round(2))
-                with col2_stats:
-                    st.write(f"**Periodo 2 ({periodo2[0]}-{periodo2[1]})**")
-                    st.dataframe(df_periodo2[Config.PRECIPITATION_COL].describe().round(2))
-    
-    with tabs[20]: # Tabla de Estaciones
-        display_station_table_tab(**display_args)
-    
-    with tabs[21]: # Generar Reporte
-        st.header("Generación de Reporte PDF")
-        st.subheader("Seleccionar Secciones para Incluir en el Reporte:")
-        report_sections_options = [
-            "Resumen General", "Tabla de Estaciones", "Mapa de Distribución Espacial",
-            "Análisis de Precipitación Mensual y Anual", "Análisis de Anomalías",
-            "Análisis de Extremos Hidrológicos (Percentiles)",
-            "Análisis de Índices de Sequía (SPI/SPEI)",
-            "Análisis de Frecuencia de Extremos", "Análisis de Correlación", "Análisis ENSO",
-            "Análisis de Tendencias y Pronósticos", "Comparación de Periodos"
-        ]
-        select_all_checkbox = st.checkbox("Seleccionar todas las secciones", value=st.session_state.select_all_report_sections_checkbox, key="select_all_report_sections_checkbox")
-        if select_all_checkbox:
-            st.session_state.selected_report_sections_multiselect = report_sections_options
-        selected_report_sections = st.multiselect(
-            "Secciones disponibles:",
-            options=report_sections_options,
-            default=st.session_state.selected_report_sections_multiselect,
-            key="selected_report_sections_multiselect"
-        )
-        st.markdown("---")
-        st.subheader("Configuración Adicional")
-        report_title = st.text_input("Título del Reporte", value="Reporte de Análisis Climatológico", key="report_title_input")
-        author_name = st.text_input("Nombre del Autor", value="Generado por SIHCLI", key="author_name_input")
-        if st.button("Generar Reporte PDF", key="generate_pdf_button"):
-            if not selected_report_sections:
-                st.warning("Por favor, seleccione al menos una sección para incluir en el reporte.")
-            else:
-                with st.spinner("Generando reporte PDF... Esto puede tardar unos minutos."):
-                    
-                    # [INICIO DE BLOQUE CORREGIDO]
-                    try:
-                        # --- 1. Preparar los datos faltantes ---
-                        
-                        # 'summary_data' (datos del resumen de filtros)
-                        summary_data = {
-                            "total_stations_count": len(gdf_stations), # Variable local
-                            "selected_stations_count": len(stations_for_analysis),
-                            "year_range": year_range,
-                            "selected_months_count": len(meses_numeros),
-                            "analysis_mode": analysis_mode,
-                            "selected_regions": sidebar_filters["selected_regions"],
-                            "selected_municipios": sidebar_filters["selected_municipios"],
-                            "selected_altitudes": sidebar_filters["selected_altitudes"]
-                        }
+        SIHCLI-POTER nace para leer este latido. Es un esfuerzo por unificar datos dispersos en una sola fuente de verdad, permitiendo a los planificadores ver el impacto de una gota de lluvia desde su caída en el páramo hasta su llegada al embalse y su distribución en la ciudad.
+        """)
+        
+    with c_aleph2:
+        st.info("""
+        **Jorge Luis Borges - El Aleph (1945)**
+        > *"En la parte inferior del escalón, hacia la derecha, vi una pequeña esfera tornasolada, de casi intolerable fulgor... El diámetro del Aleph sería de dos o tres centímetros, pero el espacio cósmico estaba ahí, sin disminución de tamaño. Cada cosa era infinitas cosas, porque yo la veía claramente desde todos los puntos del universo... vi en el Aleph la tierra, y en la tierra otra vez el Aleph... y sentí vértigo"*
+        """)
 
-                        # 'df_anomalies' (calculadas con la función de analysis.py)
-                        # (calculate_monthly_anomalies ya está importada en app.py)
-                        df_anomalies = calculate_monthly_anomalies(df_monthly_filtered, df_long) 
-
-                        # --- 2. Llamar a la función con los argumentos correctos ---
-                        report_pdf_bytes = generate_pdf_report(
-                            # Argumento con nombre corregido:
-                            sections_to_include=selected_report_sections,
-
-                            # Argumentos nuevos que faltaban:
-                            summary_data=summary_data,
-                            df_anomalies=df_anomalies,
-
-                            # Argumentos que ya tenías (usando variables locales):
-                            report_title=report_title,
-                            author_name=author_name,
-                            gdf_filtered=gdf_filtered,
-                            df_long=df_long,                 # Usar variable local, no st.session_state
-                            df_anual_melted=df_anual_melted,
-                            df_monthly_filtered=df_monthly_filtered,
-                            stations_for_analysis=stations_for_analysis,
-                            df_enso=df_enso                   # Usar variable local, no st.session_state
-                        )
-                        # --- Fin de la llamada a la función ---
-
-                        st.success("Reporte PDF generado exitosamente!")
-                        st.download_button(
-                            label="Descargar Reporte PDF",
-                            data=report_pdf_bytes,
-                            file_name=f"{report_title.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf",
-                            mime="application/pdf",
-                            key="download_pdf_button"
-                        )
-                    except Exception as e:
-                        st.error(f"Error al generar el reporte PDF: {e}")
-                        st.exception(e)
-                    # [FIN DE BLOQUE CORREGIDO]
-                        
-                        st.success("Reporte PDF generado exitosamente!")
-                        st.download_button(
-                            label="Descargar Reporte PDF",
-                            data=report_pdf_bytes,
-                            file_name=f"{report_title.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf",
-                            mime="application/pdf",
-                            key="download_pdf_button"
-                        )
-                    except Exception as e:
-                        st.error(f"Error al generar el reporte PDF: {e}")
-                        st.exception(e)
-                        
-if __name__ == "__main__":
-    main()
+# --- FOOTER ---
+st.divider()
+st.caption("© 2026 omejia CV | SIHCLI-POTER v3.0 | Un Aleph Hidroclimático: Plataforma de Inteligencia Territorial")

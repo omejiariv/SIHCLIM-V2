@@ -1,524 +1,1223 @@
 # modules/analysis.py
 
-import streamlit as st
+import scipy.spatial.distance
 import geopandas as gpd
-import pandas as pd
-import requests
 import numpy as np
-from scipy.stats import gamma, loglaplace, norm
-from modules.config import Config
-import rasterio
-from rasterstats import zonal_stats
+import pandas as pd
 import pymannkendall as mk
+import rasterio
+import requests
+import streamlit as st
+from rasterio.mask import mask
+from rasterio.warp import Resampling, reproject
+from scipy import stats
+from scipy.stats import loglaplace, norm
+import warnings
 
+from modules.config import Config
+
+# Intentamos importar scipy con manejo de error
+try:
+    from scipy import stats
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+# --- FUNCIÓN AUXILIAR DE DETECCIÓN (EL CEREBRO DE COMPATIBILIDAD) ---
+def get_safe_cols(df):
+    """
+    Detecta automáticamente las columnas de fecha y valor de precipitación,
+    sin importar si vienen de la BD nueva ('valor') o vieja ('precipitation').
+    """
+    if df is None or df.empty: return None, None
+    
+    # 1. Candidatos para fecha
+    c_date = next((c for c in ['fecha', Config.DATE_COL, 'ds', 'fecha_mes_año', 'Date', 'time'] if c in df.columns), None)
+    
+    # 2. Candidatos para valor (Lluvia)
+    c_val = next((c for c in ['valor', Config.PRECIPITATION_COL, 'precipitation', 'Pptn', 'lluvia', 'rain'] if c in df.columns), None)
+    
+    return c_date, c_val
 
 @st.cache_data
-def calculate_spi(series, window):
+def calculate_spi(df, col=None, window=12):
     """
-    Calcula el Índice de Precipitación Estandarizado (SPI), manejando ceros.
+    Calcula el Índice Estandarizado de Precipitación (SPI).
+    CORREGIDO: Detecta columna automáticamente y convierte Series a DataFrame.
     """
-    # Asegurar que la serie tenga índice de fecha y esté ordenada
-    series = series.sort_index()
-    
-    # Calcular la suma acumulada (rolling sum)
-    rolling_sum = series.rolling(window=window, min_periods=window).sum()
-    
-    # --- Manejo de Ceros ---
-    # 1. Separar los datos válidos (no NaN)
-    data_valid = rolling_sum.dropna()
-    data_valid = data_valid[np.isfinite(data_valid)] # Quitar inf si los hubiera
-    
-    if data_valid.empty:
-        st.warning(f"SPI-{window}: No hay suficientes datos válidos para el cálculo.")
-        return pd.Series(dtype=float)
+    # --- PARCHE DE SEGURIDAD: Convertir Series a DataFrame ---
+    # Esto soluciona el error: 'Series' object has no attribute 'columns'
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    # ---------------------------------------------------------
 
-    # 2. Calcular la probabilidad de cero (q)
-    n_total = len(data_valid)
-    n_zeros = (data_valid == 0).sum()
-    q = n_zeros / n_total
-    
-    # 3. Separar los datos estrictamente positivos para el ajuste Gamma
-    data_positive = data_valid[data_valid > 0]
-    
-    spi = pd.Series(np.nan, index=rolling_sum.index) # Serie de salida inicializada con NaN
+    if df is None or df.empty:
+        return df
 
-    # --- Ajuste Gamma y Cálculo CDF (Solo si hay datos positivos) ---
-    if not data_positive.empty:
+    df_spi = df.copy()
+    
+    # Detección automática de columnas
+    # (Asegúrate de que get_safe_cols esté importada o definida en este archivo)
+    c_date, c_val = get_safe_cols(df_spi)
+    
+    # Si nos pasan una columna específica, la usamos; si no, usamos la detectada
+    target_col = col if col and col in df_spi.columns else c_val
+    
+    if not target_col:
+        return pd.Series(dtype=float) # No se encontró columna de datos
+
+    # Asegurar índice de fecha
+    if c_date and not isinstance(df_spi.index, pd.DatetimeIndex):
         try:
-            # 4. Ajustar la distribución Gamma SOLO a los datos positivos
-            params = gamma.fit(data_positive, floc=0) 
-            shape, loc, scale = params # loc debería ser 0 por floc=0
-            
-            # 5. Calcular el CDF Gamma (G(x)) para TODOS los datos válidos (incluyendo ceros)
-            #    gamma.cdf(0, ...) dará 0, lo cual es correcto aquí.
-            cdf_gamma = gamma.cdf(data_valid, shape, loc=loc, scale=scale)
-            
-            # 6. Calcular el CDF combinado H(x) = q + (1 - q) * G(x)
-            prob_combined = q + (1 - q) * cdf_gamma
-            
-            # Asegurar que las probabilidades estén estrictamente entre 0 y 1 para norm.ppf
-            prob_combined = np.clip(prob_combined, 1e-6, 1 - 1e-6) 
-            
-            # 7. Transformar a SPI usando la inversa de la normal estándar
-            spi_calculated = norm.ppf(prob_combined)
-            
-            # Asignar los valores calculados al índice correcto en la serie de salida
-            spi.loc[data_valid.index] = spi_calculated
+            df_spi[c_date] = pd.to_datetime(df_spi[c_date])
+            df_spi = df_spi.set_index(c_date).sort_index()
+        except: pass # Si falla, asumimos que el índice ya es correcto o fallará abajo
 
-        except Exception as e:
-            st.warning(f"SPI-{window}: Falló el ajuste Gamma o cálculo CDF. Error: {e}")
-            # Dejar los valores como NaN si falla el ajuste/cálculo
-            pass # spi ya está inicializada con NaN
+    # 1. Calcular acumulado móvil (Rolling Sum)
+    df_spi["rolling_precip"] = (
+        df_spi[target_col].rolling(window=window, min_periods=window).sum()
+    )
 
-    # Manejar los casos donde solo hubo ceros (si q=1)
-    elif q == 1:
-         # Si todos los valores válidos son cero, el SPI técnicamente no está bien definido, 
-         # pero asignar 0 es una convención razonable (precipitación exactamente igual a la media de ceros).
-         spi.loc[data_valid.index] = 0.0
+    # 2. Calcular SPI (Aproximación Log-Normal / Z-Score)
+    try:
+        # Filtrar ceros y nulos para el logaritmo
+        valid_mask = (df_spi["rolling_precip"] > 0) & (df_spi["rolling_precip"].notna())
 
-    # Reemplazar infinitos (por si acaso clip no fue suficiente) y devolver
-    spi.replace([np.inf, -np.inf], np.nan, inplace=True)
-    return spi
+        # Transformación Logarítmica
+        log_precip = np.log(df_spi.loc[valid_mask, "rolling_precip"])
+
+        mean = log_precip.mean()
+        std = log_precip.std()
+
+        df_spi["spi"] = np.nan 
+
+        if std == 0:
+            df_spi["spi"] = 0
+        else:
+            # Calcular Z-score
+            df_spi.loc[valid_mask, "spi"] = (log_precip - mean) / std
+
+            # Manejo de Sequía Extrema (Valores 0)
+            min_spi = df_spi["spi"].min()
+            if pd.isna(min_spi):
+                min_spi = -3.0
+            
+            # Asignar mínimo a los valores que eran 0
+            df_spi.loc[
+                ~valid_mask
+                & df_spi["rolling_precip"].notna()
+                & (df_spi["rolling_precip"] == 0),
+                "spi",
+            ] = min_spi
+
+    except Exception:
+        df_spi["spi"] = np.nan
+
+    return df_spi["spi"]
+
 
 @st.cache_data
-def calculate_spei(precip_series, et_series, scale):
+def calculate_spei(precip_series, et_series, window=12):
     """
-    Calcula el Índice de Precipitación y Evapotranspiración Estandarizado (SPEI).
+    Calcula el SPEI usando la distribución Log-Laplace.
     """
+    scale = int(window) 
 
-    # Validación inicial de entradas
-    if precip_series is None or et_series is None:
-        st.error(f"SPEI-{scale}: precip_series o et_series es None.")
-        return pd.Series(dtype=float)
-    if precip_series.empty or et_series.empty:
-         st.warning(f"SPEI-{scale}: precip_series o et_series está vacía.")
-         return pd.Series(dtype=float)
-
-    scale = int(scale)
-    # Asegurar alineación de índices y frecuencia mensual
-    df = pd.DataFrame({'precip': precip_series, 'et': et_series}).sort_index()
-    # Intentar inferir frecuencia mensual o rellenar si es necesario
-    df = df.asfreq('MS') # Fuerza frecuencia mensual, rellenará con NaN si faltan meses
-
-    # Rellenar NaNs en et_series con la media podría ser una opción, pero puede distorsionar resultados.
-    # Por ahora, solo quitamos filas donde AMBOS son NaN o donde P es NaN
-    df.dropna(subset=['precip'], inplace=True) 
-    df['et'] = df['et'].fillna(method='ffill').fillna(method='bfill') # Relleno simple para ET si tiene NaNs
-    df.dropna(subset=['et'], inplace=True) # Quitar si aún quedan NaNs en ET
-
-    if len(df) < scale * 2: # Chequeo DESPUÉS de limpiar NaNs
-        st.warning(f"SPEI-{scale}: Serie demasiado corta ({len(df)} puntos) después de limpiar NaNs.")
+    # Validación básica
+    if (precip_series is None or et_series is None or precip_series.empty or et_series.empty):
         return pd.Series(dtype=float)
 
-    water_balance = df['precip'] - df['et']
+    # Alineación por índice
+    df = pd.DataFrame({"precip": precip_series, "et": et_series}).sort_index()
+    # Asumimos frecuencia mensual para llenar huecos correctamente
+    if not df.index.freq:
+        try: df = df.asfreq("MS")
+        except: pass
+
+    # Limpieza
+    df.dropna(subset=["precip"], inplace=True)
+    df["et"] = df["et"].fillna(method="ffill").fillna(method="bfill")
+    df.dropna(subset=["et"], inplace=True)
+
+    # --- AJUSTE INTELIGENTE DE UNIDADES ---
+    # Si 'et' parece ser Temperatura (< 40 promedio), lo convertimos a ET aprox.
+    if df["et"].mean() < 40:
+        df["et"] = df["et"] * 4.5 
+
+    if len(df) < scale * 2:
+        return pd.Series(dtype=float)
+
+    # Balance Hídrico (D)
+    water_balance = df["precip"] - df["et"]
+
+    # Acumulación
     rolling_balance = water_balance.rolling(window=scale, min_periods=scale).sum()
+
+    # Ajuste Log-Laplace
     data_for_fit = rolling_balance.dropna()
-    data_for_fit = data_for_fit[np.isfinite(data_for_fit)] # Quitar Infinitos
+    data_for_fit = data_for_fit[np.isfinite(data_for_fit)]
 
-    spei = pd.Series(np.nan, index=rolling_balance.index) # Inicializar salida con NaN
+    spei = pd.Series(np.nan, index=rolling_balance.index)
 
-    if not data_for_fit.empty and len(data_for_fit.unique()) > 1: # Añadido chequeo de más de un valor único
+    if not data_for_fit.empty and len(data_for_fit.unique()) > 1:
         try:
-            # Ajustar floc dinámicamente para evitar errores si min <= 0
-            params = loglaplace.fit(data_for_fit, floc=data_for_fit.min() - 1e-5 if data_for_fit.min() <=0 else 0) 
-
-            cdf = loglaplace.cdf(rolling_balance.dropna(), *params) # Calcular CDF solo para valores no-NaN del rolling_balance
-            cdf_series = pd.Series(cdf, index=rolling_balance.dropna().index) # Ponerlo en una Serie con el índice correcto
-
-            # Asegurar probabilidades entre casi 0 y casi 1
-            cdf_clipped = np.clip(cdf_series.values, 1e-7, 1 - 1e-7) 
-
-            spei_calculated = norm.ppf(cdf_clipped)
-
-            # Asignar los valores calculados al índice correcto en la serie de salida 'spei'
-            spei.loc[cdf_series.index] = spei_calculated
-
-        except Exception as e:
-             st.error(f"SPEI-{scale}: Falló el ajuste Log-Laplace o cálculo CDF. Error: {e}")
-             import traceback
-             st.error(traceback.format_exc()) # Imprime el traceback completo
-    elif data_for_fit.empty:
-        st.warning(f"SPEI-{scale}: No hay datos válidos (data_for_fit vacío) para ajustar la distribución después de la suma acumulada.")
-    else: # Solo un valor único
-         st.warning(f"SPEI-{scale}: Todos los valores en data_for_fit son iguales ({data_for_fit.iloc[0]}). No se puede ajustar la distribución.")
+            # Ajuste de parámetros
+            params = loglaplace.fit(
+                data_for_fit,
+                floc=data_for_fit.min() - 1e-5 if data_for_fit.min() <= 0 else 0,
+            )
+            # CDF
+            cdf = loglaplace.cdf(rolling_balance.dropna(), *params)
+            cdf_series = pd.Series(cdf, index=rolling_balance.dropna().index)
+            # Clipping y Z-Score
+            cdf_clipped = np.clip(cdf_series.values, 1e-7, 1 - 1e-7)
+            spei.loc[cdf_series.index] = norm.ppf(cdf_clipped)
+        except Exception:
+            pass 
 
     spei.replace([np.inf, -np.inf], np.nan, inplace=True)
     return spei
-    
-@st.cache_data
-def calculate_monthly_anomalies(_df_monthly_filtered, _df_long):
-    """
-    Calcula las anomalías mensuales con respecto al promedio de todo el período de datos.
-    """
-    df_monthly_filtered = _df_monthly_filtered.copy()
-    df_long = _df_long.copy()
-    
-    df_climatology = df_long[
-        df_long[Config.STATION_NAME_COL].isin(df_monthly_filtered[Config.STATION_NAME_COL].unique())
-    ].groupby([Config.STATION_NAME_COL, Config.MONTH_COL])[Config.PRECIPITATION_COL].mean() \
-     .reset_index().rename(columns={Config.PRECIPITATION_COL: 'precip_promedio_mes'})
 
-    df_anomalias = pd.merge(
-        df_monthly_filtered,
-        df_climatology,
-        on=[Config.STATION_NAME_COL, Config.MONTH_COL],
-        how='left'
+
+def calculate_monthly_anomalies(df_monthly, df_long_full):
+    """
+    Calcula anomalías mensuales.
+    CORREGIDO: Usa nombres consistentes para evitar KeyError.
+    """
+    if df_monthly.empty or df_long_full.empty:
+        return pd.DataFrame()
+    
+    # Detectar columnas en ambos dataframes
+    _, c_val_m = get_safe_cols(df_monthly)
+    _, c_val_full = get_safe_cols(df_long_full)
+    
+    if not c_val_m or not c_val_full: return pd.DataFrame()
+
+    # Calcular Climatología (Promedio por mes)
+    # Usamos Config.MONTH_COL que debe ser 'mes'
+    climatology = (
+        df_long_full.groupby(Config.MONTH_COL)[c_val_full]
+        .mean()
+        .reset_index()
     )
-    df_anomalias['anomalia'] = df_anomalias[Config.PRECIPITATION_COL] - df_anomalias['precip_promedio_mes']
-    return df_anomalias.copy()
+    
+    # Renombramos para el merge
+    col_clima_name = "climatology_ppt"
+    climatology = climatology.rename(columns={c_val_full: col_clima_name})
+    
+    # Merge
+    merged = pd.merge(df_monthly, climatology, on=Config.MONTH_COL, how="left")
+    
+    # Cálculo: Valor Actual - Promedio Histórico
+    merged["anomalia"] = merged[c_val_m] - merged[col_clima_name]
+    
+    return merged
+
+
+def estimate_temperature(altitude_m):
+    """Estimación de temperatura basada en gradiente térmico vertical (Andes)."""
+    if pd.isna(altitude_m):
+        return 25.0
+    # Gradiente típico: 28°C a nivel del mar, disminuye 0.6°C por cada 100m
+    temp = 28.0 - (0.006 * float(altitude_m))
+    return max(temp, 1.0) 
+
+
+def calculate_water_balance_turc(precip_mm, temp_c):
+    """
+    Estima Evapotranspiración Real (ETR) y Escorrentía (Q) usando la fórmula de Turc.
+    """
+    if pd.isna(precip_mm) or pd.isna(temp_c):
+        return 0, 0
+
+    # Fórmula de Turc para ETR
+    L = 300 + 25 * temp_c + 0.05 * (temp_c**3)
+    if L == 0: L = 0.001
+    
+    etr = precip_mm / np.sqrt(0.9 + (precip_mm / L) ** 2)
+
+    # Limitar ETR a la precipitación
+    etr = min(etr, precip_mm)
+
+    # Escorrentía = Precipitación - ETR
+    q = precip_mm - etr
+    return etr, q
+
+def classify_holdridge_point(precip_mm, altitude_m):
+    """Clasificación simple de Holdridge."""
+    if pd.isna(precip_mm) or pd.isna(altitude_m):
+        return "N/A"
+    
+    alt = float(altitude_m)
+    ppt = float(precip_mm)
+    
+    if alt < 1000:
+        piso = "Tropical"
+    elif alt < 2000:
+        piso = "Premontano"
+    elif alt < 3000:
+        piso = "Montano Bajo"
+    elif alt < 3500:
+        piso = "Montano-Paramo"
+    else:
+        piso = "Montano"
+
+    if ppt < 1000:
+        prov = "Bosque Seco"
+    elif ppt < 2000:
+        prov = "Bosque Húmedo"
+    elif ppt < 4000:
+        prov = "Bosque Muy Húmedo"
+    else:
+        prov = "Bosque Pluvial"
+
+    return f"{prov} {piso}"
+
+
+# ==============================================================================
+# PARTE 2: ANÁLISIS CLIMATOLÓGICO Y BALANCE HÍDRICO (Blindado)
+# ==============================================================================
+
+def calculate_morphometry(gdf_basin):
+    """
+    Calcula morfometría básica de una cuenca.
+    (Función auxiliar necesaria para el balance).
+    """
+    res = {"area_km2": 0, "perimetro_km": 0}
+    if gdf_basin is None or gdf_basin.empty:
+        return res
+    
+    try:
+        # Proyectar temporalmente a Magna Sirgas (metros) para cálculo
+        if gdf_basin.crs and gdf_basin.crs.to_string() != "EPSG:3116":
+            gdf_temp = gdf_basin.to_crs("EPSG:3116")
+        else:
+            gdf_temp = gdf_basin.copy()
+            
+        area_m2 = gdf_temp.geometry.area.sum()
+        perim_m = gdf_temp.geometry.length.sum()
+        
+        res["area_km2"] = area_m2 / 1e6
+        res["perimetro_km"] = perim_m / 1000.0
+    except:
+        pass
+    return res
 
 def calculate_percentiles_and_extremes(df_long, station_name, p_lower=10, p_upper=90):
     """
-    Calcula umbrales de percentiles y clasifica eventos extremos para una estación.
+    Calcula umbrales de percentiles y clasifica eventos extremos.
     """
-    df_station_full = df_long[df_long[Config.STATION_NAME_COL] == station_name].copy()
-    df_thresholds = df_station_full.groupby(Config.MONTH_COL)[Config.PRECIPITATION_COL].agg(
-        p_lower=lambda x: np.nanpercentile(x.dropna(), p_lower),
-        p_upper=lambda x: np.nanpercentile(x.dropna(), p_upper),
-        mean_monthly='mean'
-    ).reset_index()
-    df_station_extremes = pd.merge(df_station_full, df_thresholds, on=Config.MONTH_COL, how='left')
-    df_station_extremes['event_type'] = 'Normal'
-    is_dry = (df_station_extremes[Config.PRECIPITATION_COL] < df_station_extremes['p_lower'])
-    df_station_extremes.loc[is_dry, 'event_type'] = f'Sequía Extrema (< P{p_lower}%)'
-    is_wet = (df_station_extremes[Config.PRECIPITATION_COL] > df_station_extremes['p_upper'])
-    df_station_extremes.loc[is_wet, 'event_type'] = f'Húmedo Extremo (> P{p_upper}%)'
-    return df_station_extremes.dropna(subset=[Config.PRECIPITATION_COL]), df_thresholds
+    if df_long.empty: return pd.DataFrame(), pd.DataFrame()
+    
+    # Detección de columnas
+    c_date, c_val = get_safe_cols(df_long)
+    
+    # Detectar columna de nombre
+    c_name = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est', 'station'] if c in df_long.columns), None)
+    
+    # Detectar columna de mes
+    c_mes = next((c for c in ['mes', Config.MONTH_COL, 'month'] if c in df_long.columns), None)
+    
+    if not c_val or not c_name: return pd.DataFrame(), pd.DataFrame()
+
+    # Si no existe columna mes, la creamos
+    df_work = df_long.copy()
+    if not c_mes:
+        if c_date:
+            df_work['mes'] = pd.to_datetime(df_work[c_date]).dt.month
+            c_mes = 'mes'
+        else:
+            return pd.DataFrame(), pd.DataFrame()
+
+    # Filtrar estación
+    df_station_full = df_work[df_work[c_name] == station_name].copy()
+    
+    if df_station_full.empty: return pd.DataFrame(), pd.DataFrame()
+
+    # Calcular umbrales
+    df_thresholds = (
+        df_station_full.groupby(c_mes)[c_val]
+        .agg(
+            p_lower=lambda x: np.nanpercentile(x.dropna(), p_lower),
+            p_upper=lambda x: np.nanpercentile(x.dropna(), p_upper),
+            mean_monthly="mean",
+        )
+        .reset_index()
+    )
+    
+    # Merge y Clasificación
+    df_station_extremes = pd.merge(df_station_full, df_thresholds, on=c_mes, how="left")
+    
+    df_station_extremes["event_type"] = "Normal"
+    
+    is_dry = df_station_extremes[c_val] < df_station_extremes["p_lower"]
+    df_station_extremes.loc[is_dry, "event_type"] = f"Sequía Extrema (< P{p_lower}%)"
+    
+    is_wet = df_station_extremes[c_val] > df_station_extremes["p_upper"]
+    df_station_extremes.loc[is_wet, "event_type"] = f"Húmedo Extremo (> P{p_upper}%)"
+    
+    return df_station_extremes.dropna(subset=[c_val]), df_thresholds
+
 
 @st.cache_data
 def calculate_climatological_anomalies(_df_monthly_filtered, _df_long, baseline_start, baseline_end):
     """
-    Calcula las anomalías mensuales con respecto a un período base climatológico fijo.
+    Calcula anomalías con respecto a un período base.
     """
     df_monthly_filtered = _df_monthly_filtered.copy()
     df_long = _df_long.copy()
 
+    # Detección de columnas
+    _, c_val = get_safe_cols(df_long)
+    c_name = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in df_long.columns), None)
+    
+    # Columnas de tiempo
+    c_year = next((c for c in ['año', Config.YEAR_COL, 'year'] if c in df_long.columns), None)
+    c_month = next((c for c in ['mes', Config.MONTH_COL, 'month'] if c in df_long.columns), None)
+    
+    if not c_val or not c_name or not c_year or not c_month:
+        return df_monthly_filtered
+
+    # Filtrar periodo base
     baseline_df = df_long[
-        (df_long[Config.YEAR_COL] >= baseline_start) & 
-        (df_long[Config.YEAR_COL] <= baseline_end)
+        (df_long[c_year] >= baseline_start) & (df_long[c_year] <= baseline_end)
     ]
 
-    df_climatology = baseline_df.groupby(
-        [Config.STATION_NAME_COL, Config.MONTH_COL]
-    )[Config.PRECIPITATION_COL].mean().reset_index().rename(
-        columns={Config.PRECIPITATION_COL: 'precip_promedio_climatologico'}
+    # Calcular Climatología
+    df_climatology = (
+        baseline_df.groupby([c_name, c_month])[c_val]
+        .mean()
+        .reset_index()
+        .rename(columns={c_val: "precip_promedio_climatologico"})
     )
 
+    # Merge
     df_anomalias = pd.merge(
         df_monthly_filtered,
         df_climatology,
-        on=[Config.STATION_NAME_COL, Config.MONTH_COL],
-        how='left'
+        on=[c_name, c_month],
+        how="left",
     )
 
-    df_anomalias['anomalia'] = df_anomalias[Config.PRECIPITATION_COL] - df_anomalias['precip_promedio_climatologico']
+    df_anomalias["anomalia"] = df_anomalias[c_val] - df_anomalias["precip_promedio_climatologico"]
     return df_anomalias
 
+
 @st.cache_data
-def analyze_events(index_series, threshold, event_type='drought'):
+def analyze_events(index_series, threshold, event_type="drought"):
     """
-    Identifica y caracteriza eventos de sequía o humedad en una serie de tiempo de índices.
+    Identifica eventos de sequía/humedad (Rachas).
     """
-    if event_type == 'drought':
+    if index_series.empty: return pd.DataFrame()
+
+    if event_type == "drought":
         is_event = index_series < threshold
-    else: # 'wet'
+    else:  # 'wet'
         is_event = index_series > threshold
 
     event_blocks = (is_event.diff() != 0).cumsum()
     active_events = is_event[is_event]
-    if active_events.empty:
-        return pd.DataFrame()
+    
+    if active_events.empty: return pd.DataFrame()
 
     events = []
     for event_id, group in active_events.groupby(event_blocks):
         start_date = group.index.min()
         end_date = group.index.max()
         duration = len(group)
-        
         event_values = index_series.loc[start_date:end_date]
-        
-        magnitude = event_values.sum()
-        intensity = event_values.mean()
-        peak = event_values.min() if event_type == 'drought' else event_values.max()
 
         events.append({
-            'Fecha Inicio': start_date,
-            'Fecha Fin': end_date,
-            'Duración (meses)': duration,
-            'Magnitud': magnitude,
-            'Intensidad': intensity,
-            'Pico': peak
+            "Fecha Inicio": start_date,
+            "Fecha Fin": end_date,
+            "Duración (meses)": duration,
+            "Magnitud": event_values.sum(),
+            "Intensidad": event_values.mean(),
+            "Pico": event_values.min() if event_type == "drought" else event_values.max(),
         })
 
-    if not events:
-        return pd.DataFrame()
+    if not events: return pd.DataFrame()
+    return pd.DataFrame(events).sort_values(by="Fecha Inicio").reset_index(drop=True)
 
-    events_df = pd.DataFrame(events)
-    return events_df.sort_values(by='Fecha Inicio').reset_index(drop=True)
 
 @st.cache_data
 def calculate_basin_stats(_gdf_stations, _gdf_basins, _df_monthly, basin_name, basin_col_name):
     """
-    Calcula estadísticas de precipitación para todas las estaciones dentro de una cuenca específica.
+    Calcula estadísticas para estaciones dentro de una cuenca.
     """
     if _gdf_basins is None or basin_col_name not in _gdf_basins.columns:
-        return pd.DataFrame(), [], "El GeoDataFrame de cuencas o la columna de nombres no es válida."
+        return pd.DataFrame(), [], "GeoDataFrame de cuencas inválido."
 
     target_basin = _gdf_basins[_gdf_basins[basin_col_name] == basin_name]
     if target_basin.empty:
-        return pd.DataFrame(), [], f"No se encontró la cuenca llamada '{basin_name}'."
+        return pd.DataFrame(), [], f"No se encontró la cuenca '{basin_name}'."
 
+    # Spatial Join
+    # Aseguramos proyecciones iguales
+    if _gdf_stations.crs != target_basin.crs:
+        target_basin = target_basin.to_crs(_gdf_stations.crs)
+        
     stations_in_basin = gpd.sjoin(_gdf_stations, target_basin, how="inner", predicate="within")
-    station_names_in_basin = stations_in_basin[Config.STATION_NAME_COL].unique().tolist()
+    
+    # Detectar columna de nombre en estaciones
+    c_name_est = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in stations_in_basin.columns), None)
+    
+    if not c_name_est: return pd.DataFrame(), [], "Error: Columna nombre no encontrada."
+    
+    station_names = stations_in_basin[c_name_est].unique().tolist()
 
-    if not station_names_in_basin:
+    if not station_names:
         return pd.DataFrame(), [], None
 
-    df_basin_precip = _df_monthly[_df_monthly[Config.STATION_NAME_COL].isin(station_names_in_basin)]
+    # Filtrar datos de lluvia
+    # Detectar columna nombre en datos mensuales
+    c_name_data = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in _df_monthly.columns), None)
+    _, c_val = get_safe_cols(_df_monthly)
+    
+    if not c_name_data or not c_val: return pd.DataFrame(), [], "Error estructura datos."
+
+    df_basin_precip = _df_monthly[_df_monthly[c_name_data].isin(station_names)]
+    
     if df_basin_precip.empty:
-        return pd.DataFrame(), station_names_in_basin, "No hay datos de precipitación para las estaciones en esta cuenca."
-    
-    stats = df_basin_precip[Config.PRECIPITATION_COL].describe().reset_index()
-    stats.columns = ['Métrica', 'Valor']
-    stats['Valor'] = stats['Valor'].round(2)
-    
-    return stats, station_names_in_basin, None
+        return pd.DataFrame(), station_names, "No hay datos de precipitación en esta zona."
+
+    stats = df_basin_precip[c_val].describe().reset_index()
+    stats.columns = ["Métrica", "Valor"]
+    stats["Valor"] = stats["Valor"].round(2)
+
+    return stats, station_names, None
+
 
 @st.cache_data
 def get_mean_altitude_for_basin(_basin_geometry):
     """
-    Calcula la altitud media de una cuenca consultando la API de Open-Elevation.
+    Consulta API Open-Elevation.
     """
     try:
-        # Simplificamos la geometría para reducir el tamaño de la consulta
         simplified_geom = _basin_geometry.simplify(tolerance=0.01)
-        
-        # Obtenemos los puntos del contorno exterior del polígono
         exterior_coords = list(simplified_geom.exterior.coords)
         
-        # Creamos la estructura de datos para la API
+        # Limitar puntos para no saturar la API
+        if len(exterior_coords) > 50:
+            exterior_coords = exterior_coords[::int(len(exterior_coords)/50)]
+
         locations = [{"latitude": lat, "longitude": lon} for lon, lat in exterior_coords]
+
+        response = requests.post(
+            "https://api.open-elevation.com/api/v1/lookup",
+            json={"locations": locations},
+            timeout=5 # Timeout rápido para no bloquear la app
+        )
+        if response.status_code != 200: return None, "API Error"
+
+        results = response.json().get("results", [])
+        if not results: return None, "No data"
         
-        # Hacemos la llamada a la API de Open-Elevation
-        response = requests.post("https://api.open-elevation.com/api/v1/lookup", json={"locations": locations})
-        response.raise_for_status()
-        
-        results = response.json()['results']
-        elevations = [res['elevation'] for res in results]
-        
-        # Calculamos la media de las elevaciones obtenidas
-        mean_altitude = np.mean(elevations)
-        
-        return mean_altitude, None
+        elevations = [res["elevation"] for res in results]
+        return np.mean(elevations), None
     except Exception as e:
-        error_message = f"No se pudo obtener la altitud de la cuenca: {e}"
-        st.warning(error_message)
-        return None, error_message
+        return None, str(e)
 
-def calculate_hydrological_balance(mean_precip_mm, mean_altitude_m, basin_geometry_input, delta_temp_c=0.0):
+
+def calculate_hydrological_balance(precip_mm, alt_m, gdf_basin, delta_temp_c=0):
     """
-    Calcula el balance hídrico (P - ET = Q) para una cuenca.
+    Balance Hídrico (Turc) con cálculo de volumen.
+    """
+    # Valores por defecto seguros
+    res_vacio = {k:0 for k in ["P","ET","Q","Q_mm","Vol","Q_m3_año","Alt","Area"]}
     
-    NUEVO: Acepta un 'delta_temp_c' para modelar escenarios.
-    Asume un incremento del 6% en ETP por cada 1°C de aumento.
-    """
-    results = {
-        "P_media_anual_mm": mean_precip_mm,
-        "Altitud_media_m": mean_altitude_m,
-        "ET_media_anual_mm": None,
-        "Q_mm": None,
-        "Q_m3_año": None,
-        "Area_km2": None,
-        "error": None
-    }
+    if precip_mm is None or pd.isna(precip_mm) or precip_mm <= 0:
+        return res_vacio
 
-    if mean_altitude_m is None or pd.isna(mean_altitude_m):
-        results["error"] = "No se pudo calcular el balance; la altitud media es desconocida (N/A). Verifique el DEM."
-        return results
+    # Temperatura estimada
+    t = estimate_temperature(alt_m) + delta_temp_c
 
-    # 1. Calcular Evapotranspiración (ET) base
-    eto_dia_base = 4.37 * np.exp(-0.0002 * mean_altitude_m)
+    # Turc
+    L = 300 + 25 * t + 0.05 * t**3
+    if L == 0: L = 0.001
+    denom = np.sqrt(0.9 + (precip_mm / L) ** 2)
+    etr = precip_mm / denom if denom != 0 else precip_mm
+    etr = min(etr, precip_mm)
+
+    q = precip_mm - etr # Escorrentía mm
+
+    # Morfometría (Área)
+    morph = calculate_morphometry(gdf_basin)
+    area = morph.get("area_km2", 0)
+
+    # Volumen (mm * km2 * 1000 = m3) -> NO, mm * km2 / 1000 = Mm3?
+    # 1 mm = 1 L/m2
+    # 1 km2 = 1,000,000 m2
+    # 1 mm en 1 km2 = 1,000,000 Litros = 1,000 m3
+    # Vol (Mm3) = Q(mm) * Area(km2) / 1000
     
-    # 2. Aplicar el delta de temperatura (Asumir +6% ETP por cada +1°C)
-    etp_increase_factor = (1.0 + (0.06 * delta_temp_c))
-    eto_dia_escenario = eto_dia_base * etp_increase_factor
-    eto_anual_mm = eto_dia_escenario * 365.25
-    results["ET_media_anual_mm"] = eto_anual_mm
-
-    # 3. Calcular la Escorrentía (Q)
-    q_mm = mean_precip_mm - eto_anual_mm
-    results["Q_mm"] = q_mm
-
-    # 4. Calcular el Caudal en Volumen
-    try:
-        basin_metric = basin_geometry_input.to_crs("EPSG:3116") # Proyección métrica para área
-        area_m2 = basin_metric.area.sum()
-        results["Area_km2"] = area_m2 / 1_000_000
-        
-        q_m = q_mm / 1000
-        q_volumen_m3_anual = q_m * area_m2
-        results["Q_m3_año"] = q_volumen_m3_anual
-    except Exception as e:
-        results["error"] = f"Error al calcular el área de la cuenca: {e}"
-
-    return results
-    
-def calculate_morphometry(basin_gdf, dem_path):
-    """
-    Calcula la morfometría, re-proyectando la cuenca al CRS del DEM
-    para asegurar la compatibilidad y evitar errores de 'N/A'.
-    """
-    if basin_gdf.empty or basin_gdf.iloc[0].geometry is None:
-        return {"error": "Geometría de cuenca no válida."}
-
-    # --- Cálculos Geométricos (en proyección métrica) ---
-    basin_metric = basin_gdf.to_crs("EPSG:3116")
-    geom_metric = basin_metric.iloc[0].geometry
-    area_m2 = geom_metric.area
-    perimetro_m = geom_metric.length
-    indice_forma = perimetro_m / (2 * np.sqrt(np.pi * area_m2)) if area_m2 > 0 else 0
-
-    # --- Cálculos de Elevación (en la proyección del DEM) ---
-    stats = {}
-    try:
-        with rasterio.open(dem_path) as src:
-            nodata_value = src.nodata
-            dem_crs = src.crs # Obtener el CRS del DEM
-
-        # Reproyectar la cuenca al CRS del DEM para el análisis zonal
-        basin_reprojected = basin_gdf.to_crs(dem_crs)
-        
-        z_stats = zonal_stats(basin_reprojected, dem_path, stats="min max mean", nodata=nodata_value)
-        
-        if z_stats and z_stats[0].get('min') is not None:
-            stats['alt_min'] = z_stats[0].get('min')
-            stats['alt_max'] = z_stats[0].get('max')
-            stats['alt_prom'] = z_stats[0].get('mean')
-        else:
-            stats['error_dem'] = "No se encontraron datos de elevación válidos en el área de la cuenca."
-
-    except Exception as e:
-        stats['error_dem'] = f"No se pudieron calcular las estadísticas de elevación: {e}"
+    vol_mm3 = (q * area) / 1000.0 
 
     return {
-        "area_km2": area_m2 / 1_000_000,
-        "perimetro_km": perimetro_m / 1_000,
-        "indice_forma": indice_forma,
-        "alt_max_m": stats.get('alt_max'),
-        "alt_min_m": stats.get('alt_min'),
-        "alt_prom_m": stats.get('alt_prom'),
-        "error": stats.get('error_dem')
+        "P": precip_mm,
+        "P_media_anual_mm": precip_mm,
+        "ET": etr,
+        "ET_media_anual_mm": etr,
+        "Q": q,
+        "Q_mm": q,
+        "Vol": vol_mm3,
+        "Q_m3_año": vol_mm3 * 1e6, # m3 totales
+        "Alt": alt_m,
+        "Area": area,
     }
 
-def calculate_hypsometric_curve(basin_gdf, dem_path):
+# ==============================================================================
+# PARTE 3: MORFOMETRÍA, CURVA HIPSOMÉTRICA Y TENDENCIAS (Blindado)
+# ==============================================================================
+
+def calculate_morphometry(gdf_basin, dem_path=None):
     """
-    Calcula los datos para la curva hipsométrica, ajusta un polinomio de grado 3
-    y devuelve los datos, la ecuación y el R².
+    Calcula métricas morfométricas básicas y avanzadas (si hay DEM).
     """
+    if gdf_basin is None or gdf_basin.empty:
+        return {"area_km2":0, "perimetro_km":0, "alt_max_m":0, "alt_min_m":0, "alt_prom_m":0, "pendiente_prom":0}
+
+    # Proyección para área (EPSG:3116 Colombia Magna Sirgas u otro métrico)
+    try: 
+        gdf_proj = gdf_basin.to_crs(epsg=3116)
+    except: 
+        gdf_proj = gdf_basin # Si falla, usamos el que traiga (esperando que sea métrico)
+
+    area_km2 = gdf_proj.area.sum() / 1e6
+    perimetro_km = gdf_proj.length.sum() / 1000
+    indice_forma = (0.28 * perimetro_km) / np.sqrt(area_km2) if area_km2 > 0 else 0
+
+    # --- CÁLCULO REAL DE ALTITUDES CON DEM ---
+    alt_max, alt_min, alt_med, pendiente_prom = 0, 0, 0, 0
+    
+    if dem_path:
+        try:
+            import rasterio
+            from rasterio.mask import mask # Importación local segura
+            
+            with rasterio.open(dem_path) as src:
+                # Asegurar CRS
+                if gdf_basin.crs != src.crs:
+                    geom_for_mask = gdf_basin.to_crs(src.crs).geometry
+                else:
+                    geom_for_mask = gdf_basin.geometry
+
+                # Máscara
+                out_image, _ = mask(src, geom_for_mask, crop=True, nodata=src.nodata)
+                data = out_image[0]
+                validos = data[data != src.nodata]
+                validos = validos[validos > -100] # Filtro ruido
+
+                if validos.size > 0:
+                    alt_max = float(np.max(validos))
+                    alt_min = float(np.min(validos))
+                    alt_med = float(np.mean(validos))
+                    
+                    # Pendiente aproximada (Relief Ratio)
+                    longitud_aprox = np.sqrt(area_km2 * 1e6) 
+                    if longitud_aprox > 0:
+                        pendiente_prom = ((alt_max - alt_min) / longitud_aprox) * 100
+        except Exception as e:
+            # print(f"Error procesando DEM en morphometry: {e}")
+            # Fallback a simulación
+            alt_max, alt_min, alt_med = 2800, 800, 1800
+    else:
+        # Fallback si no hay ruta DEM
+        alt_max, alt_min, alt_med = 2800, 800, 1800
+
+    return {
+        "area_km2": area_km2,
+        "perimetro_km": perimetro_km,
+        "indice_forma": indice_forma,
+        "alt_max_m": alt_max,
+        "alt_min_m": alt_min,
+        "alt_prom_m": alt_med,
+        "pendiente_prom": pendiente_prom,
+    }
+
+
+def calculate_hypsometric_curve(gdf_basin, dem_path=None):
+    """
+    Genera la curva hipsométrica REAL leyendo el DEM y recortando por la cuenca.
+    """
+    if gdf_basin is None or gdf_basin.empty:
+        return None
+
+    elevations = []
+    
+    # 1. INTENTAR LEER DEL DEM SI EXISTE
+    if dem_path:
+        try:
+            import rasterio
+            from rasterio.mask import mask
+            
+            with rasterio.open(dem_path) as src:
+                if gdf_basin.crs != src.crs:
+                    gdf_basin_proj = gdf_basin.to_crs(src.crs)
+                else:
+                    gdf_basin_proj = gdf_basin
+
+                out_image, _ = mask(
+                    src, 
+                    gdf_basin_proj.geometry, 
+                    crop=True, 
+                    nodata=src.nodata
+                )
+                
+                data = out_image[0]
+                elevations = data[data != src.nodata]
+                # Filtro valores absurdos
+                elevations = elevations[(elevations > -100) & (elevations < 6000)]
+
+        except Exception as e:
+            # print(f"Error leyendo DEM: {e}")
+            elevations = []
+
+    # 2. SI FALLA EL DEM, USAR FALLBACK SINTÉTICO
+    if len(elevations) == 0:
+        morph = calculate_morphometry(gdf_basin)
+        min_z, max_z = morph["alt_min_m"], morph["alt_max_m"]
+        n_points = 1000
+        elevations = np.linspace(min_z, max_z, n_points)
+
+    # 3. CALCULAR CURVA
+    elevations_sorted = np.sort(elevations)[::-1] 
+    n_pixels = len(elevations_sorted)
+    
+    area_percent = np.arange(1, n_pixels + 1) / n_pixels * 100
+    
+    # Reducir resolución para graficar (optimización web)
+    if n_pixels > 200:
+        indices = np.linspace(0, n_pixels - 1, 200, dtype=int)
+        elevations_plot = elevations_sorted[indices]
+        area_plot = area_percent[indices]
+    else:
+        elevations_plot = elevations_sorted
+        area_plot = area_percent
+
+    # 4. Ajuste de Ecuación
     try:
-        with rasterio.open(dem_path) as src:
-            dem_crs = src.crs
-            basin_reprojected = basin_gdf.to_crs(dem_crs)
-            
-            zonal_result = zonal_stats(
-                basin_reprojected,
-                dem_path,
-                stats="count", # Pedimos 'count' para asegurar que obtenemos los datos
-                raster_out=True, # ¡Clave! Extrae los valores crudos del ráster
-                nodata=src.nodata
-            )
-            
-            if not zonal_result or 'mini_raster_array' not in zonal_result[0]:
-                 return {"error": "No se pudo extraer datos del ráster para la cuenca."}
-                 
-            elevations = zonal_result[0]['mini_raster_array'].compressed()
-            
-            if elevations.size == 0:
-                return {"error": "No se encontraron valores de elevación válidos en la cuenca."}
+        coeffs = np.polyfit(area_plot, elevations_plot, 3)
+        poly_model = np.poly1d(coeffs)
+        
+        eq_str = (
+            f"H = {coeffs[0]:.2e}A³ "
+            f"{'+' if coeffs[1]>=0 else '-'} {abs(coeffs[1]):.2e}A² "
+            f"{'+' if coeffs[2]>=0 else '-'} {abs(coeffs[2]):.2e}A "
+            f"{'+' if coeffs[3]>=0 else '-'} {abs(coeffs[3]):.2f}"
+        )
+    except:
+        eq_str = "N/A"
+        poly_model = lambda x: x
 
-        # Ordenar las elevaciones de menor a mayor
-        elevations_sorted = np.sort(elevations)
-        total_pixels = len(elevations_sorted)
-        
-        # Calcular el porcentaje de área acumulada que está POR ENCIMA de una elevación dada
-        # (1 - [posición / total]) * 100
-        cumulative_area_percent = (1 - np.arange(total_pixels) / total_pixels) * 100
-
-        # --- AJUSTE DE CURVA POLINOMIAL (TU SOLICITUD) ---
-        # Normalizamos el eje X (área) a un rango de [0, 1] para mejorar la estabilidad numérica
-        x_norm = cumulative_area_percent / 100.0
-        
-        # Ajustamos un polinomio de grado 3 (puedes cambiar el '3' si quieres otro grado)
-        coeffs = np.polyfit(x_norm, elevations_sorted, 3)
-        p = np.poly1d(coeffs) # 'p' es ahora la función polinomial
-        
-        # Generamos los puntos de la curva ajustada para graficar
-        x_fit = np.linspace(0, 100, 200) # 200 puntos para una curva suave
-        y_fit = p(x_fit / 100.0)
-        
-        # Calculamos el R² (coeficiente de determinación)
-        y_predicted = p(x_norm)
-        ss_res = np.sum((elevations_sorted - y_predicted) ** 2)
-        ss_tot = np.sum((elevations_sorted - np.mean(elevations_sorted)) ** 2)
-        r_squared = 1 - (ss_res / ss_tot)
-        
-        # Formateamos la ecuación para mostrarla (y = ax³ + bx² + cx + d)
-        equation = f"y = {coeffs[0]:.2f}x³ + {coeffs[1]:.2f}x² + {coeffs[2]:.2f}x + {coeffs[3]:.0f}"
-        # --- FIN DEL AJUSTE ---
-
-        return {
-            "elevations": elevations_sorted,
-            "cumulative_area_percent": cumulative_area_percent,
-            "fit_x": x_fit,
-            "fit_y": y_fit,
-            "equation": equation,
-            "r_squared": r_squared
-        }
-    except Exception as e:
-        return {"error": f"Error al calcular la curva hipsométrica: {e}"}
+    return {
+        "elevations": elevations_plot,  # Eje Y
+        "area_percent": area_plot,      # Eje X
+        "equation": eq_str,
+        "poly_model": poly_model,
+        "source": "DEM Real" if dem_path and len(elevations) > 0 else "Simulado"
+    }
 
 def calculate_all_station_trends(df_anual, gdf_stations):
     """
-    Calcula la tendencia de Mann-Kendall y la Pendiente de Sen para todas las
-    estaciones con datos suficientes.
+    Calcula la tendencia de Mann-Kendall para todas las estaciones.
+    BLINDADO: Detecta nombres de columnas automáticamente.
     """
+    if df_anual.empty: return gpd.GeoDataFrame()
+
+    # --- DETECCIÓN DE COLUMNAS (La clave de la compatibilidad) ---
+    _, c_val = get_safe_cols(df_anual)
+    
+    # Buscar columna de nombre en datos anuales
+    c_name_data = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est', 'station'] if c in df_anual.columns), None)
+    
+    if not c_val or not c_name_data: return gpd.GeoDataFrame()
+
     trend_results = []
-    stations_with_data = df_anual[Config.STATION_NAME_COL].unique()
+    stations_with_data = df_anual[c_name_data].unique()
 
     for station in stations_with_data:
-        station_data = df_anual[df_anual[Config.STATION_NAME_COL] == station].dropna(subset=[Config.PRECIPITATION_COL])
-        # Asegurar un mínimo de 10 años para una tendencia más robusta
+        station_data = df_anual[df_anual[c_name_data] == station].dropna(subset=[c_val])
+        
+        # Mínimo 10 años para tendencia
         if len(station_data) >= 10:
             try:
-                mk_result = mk.original_test(station_data[Config.PRECIPITATION_COL])
+                mk_result = mk.original_test(station_data[c_val])
                 trend_results.append({
-                    Config.STATION_NAME_COL: station,
-                    'slope_sen': mk_result.slope,
-                    'p_value': mk_result.p
+                    c_name_data: station, # Usamos el nombre de col que encontramos
+                    "slope_sen": mk_result.slope,
+                    "p_value": mk_result.p,
                 })
             except Exception:
-                continue # Ignora estaciones donde la prueba pueda fallar
+                continue
 
     if not trend_results:
         return gpd.GeoDataFrame()
 
     df_trends = pd.DataFrame(trend_results)
+
+    # --- UNIÓN CON GEOMETRÍA ---
+    # Buscar columna de nombre en geo
+    c_name_geo = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in gdf_stations.columns), None)
     
-    # Unir los resultados con la información geoespacial de las estaciones
+    if not c_name_geo: return gpd.GeoDataFrame()
+
+    # Merge flexible
     gdf_trends = pd.merge(
-        gdf_stations,
-        df_trends,
-        on=Config.STATION_NAME_COL
+        gdf_stations, 
+        df_trends, 
+        left_on=c_name_geo, 
+        right_on=c_name_data
     )
-    
+
     return gpd.GeoDataFrame(gdf_trends)
 
+# ==============================================================================
+# PARTE 4: RASTERIZACIÓN Y ZONIFICACIÓN CLIMÁTICA (FINAL)
+# ==============================================================================
+
+def generate_life_zone_raster(dem_path, ppt_path, mask_geom=None, downscale_factor=1):
+    """
+    Genera una matriz de Zonas de Vida cruzando Raster de Altura (DEM) y Precipitación.
+    Optimizado para memoria y manejo de CRS.
+    """
+    try:
+        import rasterio
+        from rasterio.warp import reproject, Resampling
+        from rasterio.io import MemoryFile
+        from rasterio.mask import mask
+
+        # 1. Abrir DEM (Maestro)
+        with rasterio.open(dem_path) as src_dem:
+            # Calcular nueva resolución (Downscale para rendimiento en web)
+            dst_height = src_dem.height // downscale_factor
+            dst_width = src_dem.width // downscale_factor
+            
+            # Ajustar transformación
+            dst_transform = src_dem.transform * src_dem.transform.scale(
+                (src_dem.width / dst_width), (src_dem.height / dst_height)
+            )
+
+            # Leer y redimensionar DEM
+            dem_arr = np.empty((dst_height, dst_width), dtype=np.float32)
+            reproject(
+                source=rasterio.band(src_dem, 1),
+                destination=dem_arr,
+                src_transform=src_dem.transform,
+                src_crs=src_dem.crs,
+                dst_transform=dst_transform,
+                dst_crs=src_dem.crs,
+                resampling=Resampling.bilinear,
+            )
+
+            # Perfil para el output
+            profile = src_dem.profile.copy()
+            profile.update({
+                "height": dst_height,
+                "width": dst_width,
+                "transform": dst_transform,
+                "dtype": "int16",
+                "nodata": 0,
+                "count": 1
+            })
+
+        # 2. Abrir PPT y alinearlo al DEM
+        with rasterio.open(ppt_path) as src_ppt:
+            ppt_arr = np.empty((dst_height, dst_width), dtype=np.float32)
+            reproject(
+                source=rasterio.band(src_ppt, 1),
+                destination=ppt_arr,
+                src_transform=src_ppt.transform,
+                src_crs=src_ppt.crs,
+                dst_transform=dst_transform,  # Usamos la rejilla del DEM
+                dst_crs=src_dem.crs,          # Usamos el CRS del DEM
+                resampling=Resampling.bilinear,
+            )
+
+        # 3. Clasificación Vectorizada (Holdridge Simplificado)
+        lz_arr = np.zeros_like(dem_arr, dtype=np.int16)
+
+        # Máscara de datos válidos (evitar nodata del DEM y PPT)
+        valid = (dem_arr > -500) & (ppt_arr >= 0) & np.isfinite(dem_arr) & np.isfinite(ppt_arr)
+
+        if np.any(valid):
+            alt = dem_arr[valid]
+            ppt = ppt_arr[valid]
+            zones = np.zeros_like(alt, dtype=np.int16)
+
+            # --- Lógica Holdridge Vectorizada ---
+            # 1: Bs-T, 2: Bh-T, ... (Códigos internos para visualización)
+            
+            # Tropical (<1000m)
+            mask_T = alt < 1000
+            zones[mask_T & (ppt < 1000)] = 1  # b-s-T
+            zones[mask_T & (ppt >= 1000) & (ppt < 2000)] = 2  # b-h-T
+            zones[mask_T & (ppt >= 2000) & (ppt < 4000)] = 3  # b-mh-T
+            zones[mask_T & (ppt >= 4000)] = 4  # b-pl-T
+
+            # Premontano (1000-2000m)
+            mask_P = (alt >= 1000) & (alt < 2000)
+            zones[mask_P & (ppt < 1000)] = 5
+            zones[mask_P & (ppt >= 1000) & (ppt < 2000)] = 6
+            zones[mask_P & (ppt >= 2000) & (ppt < 4000)] = 7
+            zones[mask_P & (ppt >= 4000)] = 8
+
+            # Montano Bajo (2000-3000m)
+            mask_MB = (alt >= 2000) & (alt < 3000)
+            zones[mask_MB & (ppt < 1000)] = 9
+            zones[mask_MB & (ppt >= 1000) & (ppt < 2000)] = 10
+            zones[mask_MB & (ppt >= 2000) & (ppt < 4000)] = 11
+            zones[mask_MB & (ppt >= 4000)] = 12
+
+            # Montano (>3000m)
+            mask_M = alt >= 3000
+            zones[mask_M & (ppt < 1000)] = 13
+            zones[mask_M & (ppt >= 1000)] = 14
+
+            lz_arr[valid] = zones
+
+        # 4. Aplicar Máscara de Cuenca (Si existe)
+        if mask_geom is not None:
+            with MemoryFile() as memfile:
+                with memfile.open(**profile) as dataset:
+                    dataset.write(lz_arr, 1)
+
+                    # Reproyectar geometría máscara si es necesario
+                    if hasattr(mask_geom, "crs") and mask_geom.crs != src_dem.crs:
+                        mask_geom_proj = mask_geom.to_crs(src_dem.crs)
+                    else:
+                        mask_geom_proj = mask_geom
+
+                    try:
+                        out_img, _ = mask(
+                            dataset, 
+                            mask_geom_proj.geometry, 
+                            crop=True, 
+                            nodata=0
+                        )
+                        lz_arr = out_img[0]
+                        # Nota: Si recortamos, el shape cambia, pero para visualización rápida
+                        # a veces es mejor mantener el canvas original y solo poner ceros.
+                        # Aquí devolvemos el recortado para ahorrar proceso.
+                    except Exception:
+                        pass # Si falla el recorte, devolvemos el cuadro completo
+
+        return lz_arr, dst_transform, src_dem.crs
+
+    except Exception as e:
+        # print(f"Error generando LZ Raster: {e}")
+        return None, None, None
 
 
+def calculate_climatic_indices(series_mensual, alt_m):
+    """
+    Calcula Índices de Aridez (Martonne) y Erosividad (Fournier).
+    Robusto ante series incompletas.
+    """
+    if series_mensual is None or series_mensual.empty:
+        return {}
+
+    # Datos base
+    # Asumimos que 'series_mensual' es una serie temporal larga o un ciclo de 12 meses.
+    # P_total_anual_promedio = promedio_mensual * 12
+    mean_monthly = series_mensual.mean()
+    P_total = mean_monthly * 12
+    
+    # Temperatura estimada
+    T_media = estimate_temperature(alt_m)
+
+    # 1. Índice de Martonne (Aridez)
+    # I_M = P / (T + 10)
+    # Evitar división por cero
+    denom = T_media + 10
+    im = P_total / denom if denom != 0 else 0
+
+    if im < 5: im_cat = "Desierto Absoluto"
+    elif im < 10: im_cat = "Árido"
+    elif im < 20: im_cat = "Semiárido"
+    elif im < 30: im_cat = "Mediterráneo / Semihúmedo"
+    elif im < 60: im_cat = "Húmedo"
+    else: im_cat = "Perhúmedo"
+
+    # 2. Índice de Fournier Modificado (Erosividad - MFI)
+    # MFI = Sum(pi^2) / P_total
+    try:
+        # Si tiene índice fecha, agrupamos por mes para obtener el ciclo promedio
+        if isinstance(series_mensual.index, pd.DatetimeIndex):
+            monthly_means = series_mensual.groupby(series_mensual.index.month).mean()
+        else:
+            # Si no es fecha, asumimos que ya son valores mensuales representativos
+            monthly_means = series_mensual 
+
+        sum_p2 = (monthly_means**2).sum()
+        mfi = sum_p2 / P_total if P_total > 0 else 0
+
+        if mfi < 60: mfi_cat = "Muy Baja"
+        elif mfi < 90: mfi_cat = "Baja"
+        elif mfi < 120: mfi_cat = "Moderada"
+        elif mfi < 160: mfi_cat = "Alta"
+        else: mfi_cat = "Muy Alta"
+    except:
+        mfi = 0
+        mfi_cat = "N/A"
+
+    return {
+        "martonne_val": im,
+        "martonne_class": im_cat,
+        "fournier_val": mfi,
+        "fournier_class": mfi_cat,
+        "temp_media": T_media,
+    }
 
 
+# ==============================================================================
+# PARTE 5: ESTADÍSTICAS EXTREMAS Y RETORNO (FINAL)
+# ==============================================================================
+
+def calculate_return_periods(df_long, station_name):
+    """
+    Calcula períodos de retorno (Gumbel) sobre máximos anuales.
+    Blindado contra cambios de nombres de columna.
+    """
+    if df_long.empty: return None, None
+
+    # --- Detección de Columnas ---
+    _, c_val = get_safe_cols(df_long)
+    c_name = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in df_long.columns), None)
+    c_year = next((c for c in ['año', Config.YEAR_COL, 'year'] if c in df_long.columns), None)
+
+    if not c_val or not c_name or not c_year: return None, "Error: Columnas no identificadas."
+
+    # 1. Filtrar datos de la estación
+    df_station = df_long[df_long[c_name] == station_name].copy()
+
+    if df_station.empty: return None, None
+
+    # 2. Obtener Máximos Anuales
+    annual_max = df_station.groupby(c_year)[c_val].max().dropna()
+
+    if len(annual_max) < 10:  # Mínimo estadístico
+        return None, "Insuficientes datos anuales (<10 años) para ajuste de Gumbel."
+
+    # 3. Ajuste Distribución Gumbel
+    try:
+        # params = (loc, scale)
+        params = stats.gumbel_r.fit(annual_max)
+
+        # 4. Calcular Valores para Tr específicos
+        tr_list = [2, 5, 10, 25, 50, 100]
+        probs = [1 - (1 / tr) for tr in tr_list]
+
+        precip_values = stats.gumbel_r.ppf(probs, *params)
+
+        df_results = pd.DataFrame({
+            "Período de Retorno (Tr)": tr_list,
+            "Probabilidad Excedencia": [f"{1/tr:.1%}" for tr in tr_list],
+            "Ppt Máxima Esperada (mm)": precip_values,
+        })
+
+        return df_results, {"params": params, "data": annual_max}
+    except Exception as e:
+        return None, f"Error en ajuste estadístico: {e}"
 
 
+def calculate_percentiles_extremes(df_long, station_name, p_low=10, p_high=90):
+    """Identifica eventos por encima/debajo de percentiles."""
+    if df_long.empty: return None
+
+    # Detección
+    _, c_val = get_safe_cols(df_long)
+    c_name = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in df_long.columns), None)
+    
+    if not c_val or not c_name: return None
+
+    df_station = df_long[df_long[c_name] == station_name].copy()
+    if df_station.empty: return None
+
+    val = df_station[c_val].dropna()
+    if val.empty: return None
+
+    # Calcular umbrales
+    thresh_low = np.percentile(val, p_low)
+    thresh_high = np.percentile(val, p_high)
+
+    # Filtrar eventos
+    df_station["Tipo Evento"] = "Normal"
+    df_station.loc[df_station[c_val] <= thresh_low, "Tipo Evento"] = f"Bajo (<P{p_low})"
+    df_station.loc[df_station[c_val] >= thresh_high, "Tipo Evento"] = f"Alto (>P{p_high})"
+
+    return df_station, thresh_low, thresh_high
 
 
+def calculate_duration_curve(series_mensual, runoff_coeff, area_km2, q_base_m3s=0):
+    """
+    Calcula Curva de Duración (FDC) usando Caudal Total (Directo + Base).
+    """
+    if series_mensual is None or series_mensual.empty:
+        return None
 
+    # 1. Caudal Directo (Rápido)
+    # Factor = Area(m2) / Tiempo(s)
+    # 30.4375 días promedio por mes * 86400 seg/día
+    factor = (area_km2 * 1000) / (30.4375 * 86400)
+    q_rapid = series_mensual * runoff_coeff * factor
+    
+    # 2. Caudal Total (Modelo Aditivo)
+    q_total = q_rapid + q_base_m3s
+
+    # 3. Ordenar
+    sorted_q = q_total.sort_values(ascending=False)
+    n = len(sorted_q)
+    if n < 5: return None
+
+    # 4. Probabilidades (Weibull)
+    probs = np.arange(1, n + 1) / (n + 1) * 100
+
+    try:
+        # Ajuste Logarítmico suele ajustar mejor que el polinómico para FDC,
+        # pero mantenemos el polinómico si da buenos resultados visuales.
+        coeffs = np.polyfit(probs, sorted_q.values, 3)
+        
+        eq_str = (
+            f"Q = {coeffs[0]:.2e}P³ "
+            f"{'+' if coeffs[1]>=0 else '-'} {abs(coeffs[1]):.2e}P² "
+            f"{'+' if coeffs[2]>=0 else '-'} {abs(coeffs[2]):.2e}P "
+            f"{'+' if coeffs[3]>=0 else '-'} {abs(coeffs[3]):.2e}"
+        )
+    except:
+        eq_str = "N/A"
+
+    return {
+        "data": pd.DataFrame({"Probabilidad": probs, "Caudal": sorted_q.values}),
+        "equation": eq_str
+    }
+
+
+def calculate_bias_correction_metrics(df_stations, df_satellite):
+    """
+    Calcula el sesgo (Bias) entre estaciones y satélite.
+    """
+    try:
+        # Detectar columnas de nombre para el merge
+        c_name_st = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in df_stations.columns), None)
+        c_name_sat = next((c for c in ['nombre', Config.STATION_NAME_COL, 'nom_est'] if c in df_satellite.columns), None)
+        
+        # Detectar columna de valor en estaciones
+        _, c_val_st = get_safe_cols(df_stations)
+        
+        if not c_name_st or not c_name_sat or not c_val_st: return None
+
+        # Unir por estación
+        df_merge = pd.merge(
+            df_stations[[c_name_st, c_val_st, "geometry"]],
+            df_satellite[[c_name_sat, "ppt_sat"]],
+            left_on=c_name_st,
+            right_on=c_name_sat
+        )
+
+        if df_merge.empty: return None
+
+        # Calcular métricas
+        # Bias Factor (Multiplicativo)
+        df_merge["bias_factor"] = df_merge[c_val_st] / df_merge["ppt_sat"].replace(0, 0.01)
+
+        # Bias Diff (Aditivo)
+        df_merge["bias_diff"] = df_merge[c_val_st] - df_merge["ppt_sat"]
+
+        # Limpieza de outliers (Factores absurdos > 10 o < 0.1)
+        df_merge = df_merge[df_merge["bias_factor"].between(0.1, 10)]
+
+        return df_merge
+    except Exception as e:
+        # print(f"Error cálculo sesgo: {e}")
+        return None
+
+
+def calculate_hydrological_statistics(series_mensual, runoff_coeff, area_km2, q_base_m3s=0):
+    """
+    Calcula estadísticas hidrológicas extremas (Qmax, Qmin) 
+    usando un MODELO ADITIVO (Superficial + Base).
+    Incluye lógica de 'Suelo Físico' para sequías extremas.
+    """
+    stats_dict = {}
+    
+    # 1. Validación
+    if series_mensual is None or series_mensual.empty:
+        return {}
+    
+    # Asegurar índice datetime
+    if not isinstance(series_mensual.index, pd.DatetimeIndex):
+        try:
+            series_mensual.index = pd.to_datetime(series_mensual.index)
+        except:
+            return {} 
+
+    # 2. CONSTRUCCIÓN DE LA SERIE DE CAUDAL TOTAL
+    # Q = Q_rápido + Q_base
+    factor_conv = (area_km2 * 1000) / (30.4375 * 86400)
+    q_rapid = series_mensual * runoff_coeff * factor_conv
+    q_total_series = q_rapid + q_base_m3s
+
+    # 3. ESTADÍSTICAS BÁSICAS
+    try:
+        stats_dict["Q_Medio"] = q_total_series.mean()
+        stats_dict["Desviacion_Std"] = q_total_series.std()
+        
+        # Q95 (Caudal Ecológico)
+        stats_dict["Q_Ecologico_Q95"] = q_total_series.quantile(0.05) 
+        
+        stats_dict["Q_Max_Historico"] = q_total_series.max()
+        stats_dict["Q_Min_Historico"] = q_total_series.min()
+    except:
+        return {}
+
+    # 4. PROYECCIONES PROBABILÍSTICAS
+    if not HAS_SCIPY: return stats_dict
+
+    try:
+        # Agrupación Anual
+        q_max_anual = q_total_series.resample('A').max().dropna()
+        q_min_anual = q_total_series.resample('A').min().dropna()
+        
+        tr_list = [2.33, 5, 10, 25, 50, 100]
+
+        # --- A. MÁXIMOS (Crecientes) -> GUMBEL ---
+        if len(q_max_anual) >= 3:
+            loc_max, scale_max = stats.gumbel_r.fit(q_max_anual)
+            for tr in tr_list:
+                prob = 1 - (1/tr)
+                val = stats.gumbel_r.ppf(prob, loc_max, scale_max)
+                stats_dict[f"Q_Max_{tr}a"] = max(0, val)
+        else:
+            for tr in tr_list: stats_dict[f"Q_Max_{tr}a"] = 0
+
+        # --- B. MÍNIMOS (Sequías) -> LOG-NORMAL ---
+        if len(q_min_anual) >= 3:
+            # Factor de Agotamiento de Acuífero:
+            # Incluso en sequía de 100 años, asumimos que el acuífero retiene 
+            # al menos un % de su capacidad de descarga base.
+            
+            # Protección para logaritmo
+            q_min_safe = q_min_anual.clip(lower=0.001) 
+            
+            log_q = np.log(q_min_safe)
+            mu_log, sigma_log = stats.norm.fit(log_q)
+            
+            for tr in tr_list:
+                prob = 1 / tr
+                val_log = stats.norm.ppf(prob, mu_log, sigma_log)
+                prediccion = np.exp(val_log)
+                
+                # SUELO FÍSICO (CONTROL DE REALIDAD)
+                suelo_fisico = q_base_m3s * 0.20 
+                
+                stats_dict[f"Q_Min_{tr}a"] = max(prediccion, suelo_fisico)
+
+        else:
+            for tr in tr_list: stats_dict[f"Q_Min_{tr}a"] = 0
+
+    except Exception:
+        pass
+
+
+    return stats_dict
